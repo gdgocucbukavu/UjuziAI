@@ -1,10 +1,8 @@
 import { BrowserRouter as Router, Routes, Route, Navigate } from 'react-router-dom';
-import { Toaster } from 'react-hot-toast';
 import { AuthProvider, useAuth } from './contexts/AuthContext';
 import { ThemeProvider } from './contexts/ThemeContext';
 import Layout from './components/Layout';
 import ScrollToTop from './components/ScrollToTop';
-import PWAInstallPrompt from './components/PWAInstallPrompt';
 import Landing from './pages/Landing';
 import Login from './pages/Login';
 import Signup from './pages/Signup';
@@ -18,6 +16,12 @@ import Certificate from './pages/Certificate';
 import Verify from './pages/Verify';
 import AllModules from './pages/AllModules';
 import Buildathon from './pages/Buildathon';
+import BuildathonDetail from './pages/BuildathonDetail';
+import BuildathonProjectDetail from './pages/BuildathonProjectDetail';
+import { Toaster } from 'react-hot-toast';
+import JudgeEvaluations from './pages/JudgeEvaluations';
+import JudgeBuildathonProjects from './pages/JudgeBuildathonProjects';
+import JudgeProjectScoring from './pages/JudgeProjectScoring';
 
 function PrivateRoute({ children }) {
   const { user, loading } = useAuth();
@@ -72,6 +76,11 @@ function AppRoutes() {
       <Route path="/exam/:moduleId" element={<PrivateRoute><Exam /></PrivateRoute>} />
       <Route path="/leaderboard" element={<PrivateRoute><Layout><Leaderboard /></Layout></PrivateRoute>} />
       <Route path="/projects" element={<PrivateRoute><Layout><Buildathon /></Layout></PrivateRoute>} />
+      <Route path="/projects/:buildathonId" element={<PrivateRoute><Layout><BuildathonDetail /></Layout></PrivateRoute>} />
+      <Route path="/projects/:buildathonId/project/:projectId" element={<PrivateRoute><Layout><BuildathonProjectDetail /></Layout></PrivateRoute>} />
+      <Route path="/judge/evaluations" element={<PrivateRoute><Layout><JudgeEvaluations /></Layout></PrivateRoute>} />
+      <Route path="/judge/buildathon/:buildathonId" element={<PrivateRoute><Layout><JudgeBuildathonProjects /></Layout></PrivateRoute>} />
+      <Route path="/judge/buildathon/:buildathonId/project/:projectId" element={<PrivateRoute><Layout><JudgeProjectScoring /></Layout></PrivateRoute>} />
       <Route path="/profile" element={<PrivateRoute><Layout><Profile /></Layout></PrivateRoute>} />
       <Route path="/certificate/:moduleId" element={<PrivateRoute><Layout><Certificate /></Layout></PrivateRoute>} />
       <Route path="/verify/:badgeId" element={<Verify />} />
@@ -100,7 +109,6 @@ export default function App() {
             }}
           />
           <AppRoutes />
-          <PWAInstallPrompt />
         </AuthProvider>
       </ThemeProvider>
     </Router>

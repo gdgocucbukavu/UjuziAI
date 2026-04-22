@@ -486,19 +486,41 @@ export function useLeaderboard() {
 
   useEffect(() => {
     const usersRef = collection(db, 'users');
-    // No limit — get ALL users for accurate count and ranking
-    const q = query(usersRef, orderBy('totalScore', 'desc'));
+    const usersQuery = query(usersRef, orderBy('totalScore', 'desc'));
+    const projectsRef = collection(db, 'buildathonProjects');
 
-    const unsub = onSnapshot(q, (snap) => {
-      const allData = [];
-      snap.forEach((doc) => {
-        const d = { id: doc.id, ...doc.data() };
-        if (!ADMIN_EMAILS_HIDDEN.includes(d.email?.toLowerCase())) {
-          allData.push(d);
-        }
+    let usersCache = [];
+    let projectsCache = [];
+
+    function recomputeLeaderboard() {
+      const communityPointsByUser = {};
+
+      projectsCache.forEach((project) => {
+        const ownerId = project?.submittedBy;
+        if (!ownerId) return;
+        const voteCount = Number.isFinite(Number(project?.voteCount))
+          ? Number(project.voteCount)
+          : (Array.isArray(project?.votes) ? project.votes.length : 0);
+        const likesCount = Number.isFinite(Number(project?.likesCount))
+          ? Number(project.likesCount)
+          : (Array.isArray(project?.likeUserIds) ? project.likeUserIds.length : 0);
+        const points = (voteCount * 10) + likesCount;
+        communityPointsByUser[ownerId] = (communityPointsByUser[ownerId] || 0) + points;
       });
-      // Sort by totalScore + bonusPoints combined
-      allData.sort((a, b) => ((b.totalScore || 0) + (b.bonusPoints || 0)) - ((a.totalScore || 0) + (a.bonusPoints || 0)));
+
+      const allData = usersCache
+        .filter((item) => !ADMIN_EMAILS_HIDDEN.includes(item.email?.toLowerCase()))
+        .map((item) => {
+          const communityPoints = Number(communityPointsByUser[item.id] || 0);
+          const leaderboardScore = Number(item.totalScore || 0) + Number(item.bonusPoints || 0) + communityPoints;
+          return {
+            ...item,
+            communityPoints,
+            leaderboardScore,
+          };
+        });
+
+      allData.sort((a, b) => (b.leaderboardScore || 0) - (a.leaderboardScore || 0));
       setTotalUsers(allData.length);
       setLeaderboard(allData);
 
@@ -507,12 +529,31 @@ export function useLeaderboard() {
         setUserRank(idx >= 0 ? idx + 1 : null);
       }
       setLoading(false);
+    }
+
+    const unsubUsers = onSnapshot(usersQuery, (snap) => {
+      const data = [];
+      snap.forEach((docSnap) => data.push({ id: docSnap.id, ...docSnap.data() }));
+      usersCache = data;
+      recomputeLeaderboard();
     }, (error) => {
-      console.error('Error listening to leaderboard:', error);
+      console.error('Error listening to leaderboard users:', error);
       setLoading(false);
     });
 
-    return () => unsub();
+    const unsubProjects = onSnapshot(projectsRef, (snap) => {
+      const data = [];
+      snap.forEach((docSnap) => data.push({ id: docSnap.id, ...docSnap.data() }));
+      projectsCache = data;
+      recomputeLeaderboard();
+    }, (error) => {
+      console.error('Error listening to buildathon projects for leaderboard:', error);
+    });
+
+    return () => {
+      unsubUsers();
+      unsubProjects();
+    };
   }, [user]);
 
   return { leaderboard, userRank, totalUsers, loading };

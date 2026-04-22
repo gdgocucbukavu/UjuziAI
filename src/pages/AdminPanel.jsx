@@ -277,10 +277,31 @@ export default function AdminPanel() {
       toast.error('Veuillez sélectionner au moins un utilisateur et un nombre de points');
       return;
     }
+
+    const parsedPoints = Number(bonusPoints);
+    if (!Number.isFinite(parsedPoints) || parsedPoints === 0) {
+      toast.error('Le nombre de points doit être différent de 0');
+      return;
+    }
+
+    if (Math.abs(parsedPoints) > 100) {
+      toast.error('La valeur maximale autorisée est 100 points (en positif ou en négatif)');
+      return;
+    }
+
+    if (parsedPoints < 0 && !bonusReason.trim()) {
+      toast.error('Veuillez préciser une raison pour le retrait de points');
+      return;
+    }
+
     setSendingBonus(true);
     try {
-      await Promise.all(selectedBonusUserIds.map((userId) => addBonusPoints(userId, Number(bonusPoints), bonusReason)));
-      toast.success(`${bonusPoints} point(s) bonus ajouté(s) à ${selectedBonusUserIds.length} utilisateur(s)`);
+      await Promise.all(selectedBonusUserIds.map((userId) => addBonusPoints(userId, parsedPoints, bonusReason.trim())));
+      if (parsedPoints > 0) {
+        toast.success(`${parsedPoints} point(s) bonus ajouté(s) à ${selectedBonusUserIds.length} utilisateur(s)`);
+      } else {
+        toast.success(`${Math.abs(parsedPoints)} point(s) bonus retiré(s) pour ${selectedBonusUserIds.length} utilisateur(s)`);
+      }
       setSelectedBonusUserIds([]);
       setBonusPoints('');
       setBonusReason('');
@@ -778,7 +799,7 @@ export default function AdminPanel() {
               <div className="glass-card p-8">
                 <h3 className="text-lg font-semibold text-heading mb-6 flex items-center gap-2">
                   <Zap className="w-5 h-5 text-amber-400" />
-                  Attribuer des points bonus
+                  Gérer les points bonus
                 </h3>
                 <div className="grid sm:grid-cols-2 gap-4 mb-4">
                   <div>
@@ -828,14 +849,14 @@ export default function AdminPanel() {
                     <p className="text-xs text-muted mt-2">{selectedBonusUserIds.length} utilisateur(s) sélectionné(s)</p>
                   </div>
                   <div>
-                    <label className="block text-sm font-medium text-body mb-2">Points</label>
+                    <label className="block text-sm font-medium text-body mb-2">Points (+ pour attribuer, - pour annuler)</label>
                     <input
                       type="number"
-                      min="1"
+                      min="-100"
                       max="100"
                       value={bonusPoints}
                       onChange={(e) => setBonusPoints(e.target.value)}
-                      placeholder="Ex: 10"
+                      placeholder="Ex: 10 ou -10"
                       className="input-field w-full"
                     />
                   </div>
@@ -846,7 +867,7 @@ export default function AdminPanel() {
                     type="text"
                     value={bonusReason}
                     onChange={(e) => setBonusReason(e.target.value)}
-                    placeholder="Ex: Gagnant buildathon, contribution communautaire..."
+                    placeholder="Ex: Attribution finale validée, correction d'erreur admin..."
                     className="input-field w-full"
                   />
                 </div>
@@ -860,7 +881,7 @@ export default function AdminPanel() {
                   ) : (
                     <Zap className="w-4 h-4" />
                   )}
-                  Attribuer les bonus
+                  Mettre à jour les bonus
                 </button>
               </div>
 

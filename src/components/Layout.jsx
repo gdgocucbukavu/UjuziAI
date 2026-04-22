@@ -16,6 +16,7 @@ import {
   Sun,
   Moon,
   Rocket,
+  ClipboardCheck,
 } from 'lucide-react';
 
 export default function Layout({ children }) {
@@ -29,6 +30,7 @@ export default function Layout({ children }) {
     { path: '/leaderboard', icon: Trophy, label: 'Classement' },
     { path: '/dashboard', icon: LayoutDashboard, label: 'Modules' },
     { path: '/projects', icon: Rocket, label: 'Buildathon' },
+    { path: '/judge/evaluations', icon: ClipboardCheck, label: 'Mes évaluations' },
     { path: '/profile', icon: User, label: 'Profil' },
   ];
 

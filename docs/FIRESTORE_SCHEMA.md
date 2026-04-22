@@ -83,6 +83,67 @@ badges/{badgeId}
 └── verified: boolean
 ```
 
+### `buildathons` (Collection)
+```
+buildathons/{buildathonId}
+├── type: 'buildathon' | 'hackathon'
+├── title: string
+├── description: string
+├── startDate: string (ISO or datetime-local)
+├── endDate: string (ISO or datetime-local)
+├── workDuration: string
+├── maxTeamSize: number
+├── prizes: Array<{ place, rewardType, points, label }>
+├── participants: string[]
+├── status: 'active' | 'completed' | ...
+├── finalized: boolean
+├── createdBy: string
+├── createdAt: Timestamp
+├── updatedAt: Timestamp
+├── archivedAt: Timestamp | null
+├── publishedAt: Timestamp | null
+├── publicationStatus: 'published' | 'draft' | 'archived'
+├── votingEnabled: boolean
+├── maxVotesPerUser: number
+├── allowSelfVote: boolean
+├── voteStartDate: string | null
+├── voteEndDate: string | null
+├── projectVisibility: 'published-only' | 'all-submitted'
+└── submissionOpen: boolean
+```
+
+### `buildathonProjects` (Collection)
+```
+buildathonProjects/{projectId}
+├── buildathonId: string
+├── title: string
+├── description: string
+├── category: string
+├── teamName: string
+├── repoUrl: string
+├── demoUrl: string
+├── members: Array<{ uid, name, email }>
+├── submittedBy: string
+├── submittedAt: Timestamp
+├── votes: string[]
+├── voteCount: number
+├── likesCount: number
+├── commentsCount: number
+├── feedbackCount: number
+├── likeUserIds: string[]
+├── projectStatus: 'brouillon' | 'soumis' | 'valide' | 'rejete' | 'publie'
+├── moderationStatus: 'pending' | 'approved' | 'rejected'
+├── moderationNote: string
+├── isPublished: boolean
+├── isPublic: boolean
+├── validatedAt: Timestamp | null
+├── validatedBy: string | null
+├── rejectedAt: Timestamp | null
+├── rejectedBy: string | null
+├── publishedAt: Timestamp | null
+└── publishedBy: string | null
+```
+
 ## Indexes Required
 
 1. `exams` - userId (ASC) + moduleId (ASC) + startedAt (DESC)

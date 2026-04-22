@@ -194,12 +194,17 @@ export default function Leaderboard() {
                   <Zap className="w-3 h-3" />+{entry.bonusPoints}
                 </p>
               )}
+              {(entry.communityPoints || 0) > 0 && (
+                <p className="text-xs text-primary-300 flex items-center gap-0.5">
+                  <Trophy className="w-3 h-3" />+{entry.communityPoints} Ujuzi
+                </p>
+              )}
             </div>
           </div>
 
           <div className="text-right flex-shrink-0">
             <p className="text-xl font-bold text-heading">
-              {(entry.totalScore || 0) + (entry.bonusPoints || 0)}
+              {entry.leaderboardScore || ((entry.totalScore || 0) + (entry.bonusPoints || 0))}
             </p>
             <p className="text-[10px] text-muted uppercase tracking-wide">points</p>
           </div>
@@ -222,6 +227,9 @@ export default function Leaderboard() {
         </h1>
         <p className="text-body text-lg max-w-md mx-auto">
           Compétez, grimpez dans les rangs et prouvez votre expertise IA
+        </p>
+        <p className="text-xs text-muted mt-2">
+          Score global UjuziAI = modules + bonus + communauté (votes x10, likes x1)
         </p>
       </div>
 

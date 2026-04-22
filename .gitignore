@@ -33,3 +33,7 @@ ui-debug.log
 # OS
 .DS_Store
 Thumbs.db
+
+# Analysis et resumé pull request
+analysis.txt
+copilot_overview.txt

@@ -11,6 +11,21 @@ import { BookOpen, Trophy, Target, TrendingUp, Sparkles, ChevronRight, ArrowLeft
 
 const INITIAL_MODULE_COUNT = 4;
 
+function getSafeDate(value) {
+  if (!value) return null;
+  const parsed = new Date(value);
+  return Number.isNaN(parsed.getTime()) ? null : parsed;
+}
+
+function getEffectiveEventEndDate(event) {
+  const candidateDates = [event?.voteEndDate, event?.submissionEndDate, event?.endDate]
+    .map((value) => getSafeDate(value))
+    .filter(Boolean);
+
+  if (candidateDates.length === 0) return null;
+  return candidateDates.reduce((latest, current) => (current > latest ? current : latest));
+}
+
 export default function Dashboard() {
   const { user, userProfile } = useAuth();
   const { progressMap, loading } = useAllProgress();
@@ -50,10 +65,11 @@ export default function Dashboard() {
   const highlightedEvents = useMemo(() => {
     const now = new Date();
     const withStatus = buildathonEvents.map((event) => {
+      const startDate = getSafeDate(event.startDate);
+      const effectiveEndDate = getEffectiveEventEndDate(event);
       let status = 'active';
-      if (event.status === 'completed') status = 'completed';
-      else if (event.startDate && new Date(event.startDate) > now) status = 'upcoming';
-      else if (event.endDate && new Date(event.endDate) < now) status = 'ended';
+      if (startDate && startDate > now) status = 'upcoming';
+      else if (effectiveEndDate && effectiveEndDate < now) status = 'ended';
       return { ...event, status };
     });
 

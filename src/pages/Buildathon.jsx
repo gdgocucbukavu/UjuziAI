@@ -1,8 +1,10 @@
-import { useState, useEffect, useMemo } from 'react';
+﻿import { useState, useEffect, useMemo } from 'react';
+import { Link } from 'react-router-dom';
 import {
   collection,
   doc,
   getDocs,
+  runTransaction,
   setDoc,
   updateDoc,
   query,
@@ -10,13 +12,13 @@ import {
   where,
   serverTimestamp,
   arrayUnion,
-  arrayRemove,
   increment,
   onSnapshot,
   deleteDoc,
 } from 'firebase/firestore';
 import { db } from '../lib/firebase';
 import { useAuth } from '../contexts/AuthContext';
+import AdminBuildathonEventForm from '../components/buildathon/AdminBuildathonEventForm';
 import toast from 'react-hot-toast';
 import {
   Trophy,
@@ -67,9 +69,11 @@ const PROJECT_CATEGORIES = [
 
 function getEventStatus(b) {
   const now = new Date();
-  if (b.status === 'completed') return 'completed';
-  if (b.startDate && new Date(b.startDate) > now) return 'upcoming';
-  if (b.endDate && new Date(b.endDate) < now) return 'ended';
+  const startDate = b.startDate ? new Date(b.startDate) : null;
+  const voteEndDate = getEffectiveEventEndDate(b);
+
+  if (startDate && startDate > now) return 'upcoming';
+  if (voteEndDate && voteEndDate < now) return 'completed';
   return 'active';
 }
 
@@ -88,6 +92,13 @@ const DEFAULT_PRIZES = [
 
 function toInputDateTime(value) {
   if (!value) return '';
+  if (typeof value === 'string') {
+    // Preserve local datetime strings as-is to avoid timezone drift in datetime-local inputs.
+    const localNoTimezonePattern = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2}(\.\d{1,3})?)?$/;
+    if (localNoTimezonePattern.test(value)) {
+      return value.slice(0, 16);
+    }
+  }
   const d = new Date(value);
   if (Number.isNaN(d.getTime())) return '';
   const pad = (n) => String(n).padStart(2, '0');
@@ -99,6 +110,43 @@ function formatEventDate(value) {
   const d = new Date(value);
   if (Number.isNaN(d.getTime())) return 'Date non définie';
   return d.toLocaleString('fr-FR', { day: 'numeric', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit' });
+}
+
+function toValidUrl(rawValue) {
+  if (!rawValue || typeof rawValue !== 'string') return null;
+  try {
+    return new URL(rawValue.trim());
+  } catch {
+    return null;
+  }
+}
+
+function isValidGitHubRepoUrl(rawValue) {
+  const parsedUrl = toValidUrl(rawValue);
+  if (!parsedUrl) return false;
+
+  const hostname = parsedUrl.hostname.toLowerCase();
+  if (parsedUrl.protocol !== 'https:' || (hostname !== 'github.com' && hostname !== 'www.github.com')) {
+    return false;
+  }
+
+  const pathParts = parsedUrl.pathname.split('/').filter(Boolean);
+  return pathParts.length >= 2;
+}
+
+function isValidDemoUrl(rawValue) {
+  const parsedUrl = toValidUrl(rawValue);
+  if (!parsedUrl) return false;
+  return parsedUrl.protocol === 'https:';
+}
+
+function getEffectiveEventEndDate(event) {
+  const candidateDates = [event?.voteEndDate, event?.submissionEndDate, event?.endDate]
+    .map((value) => (value ? new Date(value) : null))
+    .filter((date) => date && !Number.isNaN(date.getTime()));
+
+  if (candidateDates.length === 0) return null;
+  return candidateDates.reduce((latest, current) => (current > latest ? current : latest));
 }
 
 function normalizePrizeInput(prize, idx) {
@@ -113,6 +161,239 @@ function normalizePrizeInput(prize, idx) {
   };
 }
 
+function normalizeDateLike(value) {
+  if (!value) return null;
+  if (typeof value === 'string') return value;
+  if (value?.toDate && typeof value.toDate === 'function') {
+    const asDate = value.toDate();
+    return Number.isNaN(asDate.getTime()) ? null : asDate.toISOString();
+  }
+  const asDate = new Date(value);
+  return Number.isNaN(asDate.getTime()) ? null : asDate.toISOString();
+}
+
+const DEFAULT_BUILDATHON_CONFIG = {
+  votingEnabled: true,
+  maxVotesPerUser: 1,
+  allowSelfVote: false,
+  shortDescription: '',
+  fullDescription: '',
+  coverImageUrl: '',
+  submissionStartDate: null,
+  submissionEndDate: null,
+  voteStartDate: null,
+  voteEndDate: null,
+  participationRules: '',
+  evaluationCriteria: '',
+  tieBreakRuleText: 'En cas d\'égalité, le projet soumis le plus tôt est prioritaire.',
+  rewardsVisible: true,
+  projectVisibility: 'published-only',
+  submissionOpen: true,
+  publicationStatus: 'published',
+  juryModeEnabled: false,
+  juryResultsPublished: false,
+  rankingMode: 'public',
+  judgeCriteria: [],
+};
+
+const DEFAULT_BUILDATHON_PROJECT_META = {
+  projectStatus: 'soumis',
+  moderationStatus: 'pending',
+  moderationNote: '',
+  isPublished: false,
+  isPublic: false,
+  likesCount: 0,
+  commentsCount: 0,
+  feedbackCount: 0,
+  likeUserIds: [],
+  validatedAt: null,
+  validatedBy: null,
+  rejectedAt: null,
+  rejectedBy: null,
+  publishedAt: null,
+  publishedBy: null,
+};
+
+const PROJECT_STATUSES = ['brouillon', 'soumis', 'valide', 'rejete', 'publie'];
+
+function getCanonicalProjectStatus(project = {}) {
+  const raw = String(project.projectStatus || '').toLowerCase();
+  const normalizedRaw = raw
+    .replace('é', 'e')
+    .replace('à', 'a')
+    .replace('û', 'u')
+    .trim();
+
+  if (normalizedRaw === 'brouillon' || normalizedRaw === 'draft') return 'brouillon';
+  if (normalizedRaw === 'soumis' || normalizedRaw === 'submitted' || normalizedRaw === 'pending') return 'soumis';
+  if (normalizedRaw === 'valide' || normalizedRaw === 'validated' || normalizedRaw === 'approved') return 'valide';
+  if (normalizedRaw === 'rejete' || normalizedRaw === 'rejected') return 'rejete';
+  if (normalizedRaw === 'publie' || normalizedRaw === 'published') return 'publie';
+
+  // Legacy fallback mapping for old documents.
+  if (project?.moderationStatus === 'rejected') return 'rejete';
+  if (project?.isPublished === true || project?.isPublic === true) return 'publie';
+  if (project?.moderationStatus === 'approved') return 'valide';
+  return 'soumis';
+}
+
+function getModerationStatusFromProjectStatus(projectStatus) {
+  if (projectStatus === 'valide' || projectStatus === 'publie') return 'approved';
+  if (projectStatus === 'rejete') return 'rejected';
+  return 'pending';
+}
+
+function getProjectStatusBadge(status) {
+  if (status === 'publie') return { label: 'Publie', className: 'bg-green-500/10 text-green-400 border-green-500/30' };
+  if (status === 'valide') return { label: 'Valide', className: 'bg-emerald-500/10 text-emerald-400 border-emerald-500/30' };
+  if (status === 'rejete') return { label: 'Rejete', className: 'bg-red-500/10 text-red-400 border-red-500/30' };
+  if (status === 'brouillon') return { label: 'Brouillon', className: 'bg-gray-500/10 text-gray-400 border-gray-500/30' };
+  return { label: 'Soumis', className: 'bg-amber-500/10 text-amber-400 border-amber-500/30' };
+}
+
+function isProjectOwnerOrMember(project, uid) {
+  if (!uid) return false;
+  if (project?.submittedBy === uid) return true;
+  return Array.isArray(project?.members) && project.members.some((member) => member?.uid === uid);
+}
+
+function isProjectVisibleForParticipant(project, event, uid) {
+  const status = getCanonicalProjectStatus(project);
+  const isOwner = isProjectOwnerOrMember(project, uid);
+  if (isOwner) return true;
+
+  if (status === 'rejete') return false;
+
+  if ((event?.projectVisibility || 'published-only') === 'all-submitted') {
+    return status !== 'brouillon';
+  }
+
+  // Validation/publication-gated mode.
+  return status === 'publie';
+}
+
+function normalizeBuildathonEvent(event) {
+  const safeVoteStartDate = normalizeDateLike(event.voteStartDate) || normalizeDateLike(event.startDate);
+  const safeVoteEndDate = normalizeDateLike(event.voteEndDate) || normalizeDateLike(event.endDate);
+
+  return {
+    ...event,
+    shortDescription: event.shortDescription || '',
+    fullDescription: event.fullDescription || event.description || '',
+    coverImageUrl: event.coverImageUrl || '',
+    votingEnabled: event.votingEnabled !== false,
+    maxVotesPerUser: 1,
+    allowSelfVote: event.allowSelfVote === true,
+    submissionStartDate: normalizeDateLike(event.submissionStartDate) || normalizeDateLike(event.startDate),
+    submissionEndDate: normalizeDateLike(event.submissionEndDate) || normalizeDateLike(event.endDate),
+    voteStartDate: safeVoteStartDate,
+    voteEndDate: safeVoteEndDate,
+    participationRules: event.participationRules || '',
+    evaluationCriteria: event.evaluationCriteria || '',
+    tieBreakRuleText: event.tieBreakRuleText || 'En cas d\'égalité, le projet soumis le plus tôt est prioritaire.',
+    rewardsVisible: event.rewardsVisible !== false,
+    projectVisibility: event.projectVisibility || 'published-only',
+    submissionOpen: event.submissionOpen !== false,
+    publicationStatus: event.publicationStatus || 'published',
+    juryModeEnabled: event.juryModeEnabled === true,
+    juryResultsPublished: event.juryResultsPublished === true,
+    rankingMode: event.rankingMode || 'public',
+    judgeCriteria: Array.isArray(event.judgeCriteria) ? event.judgeCriteria : [],
+    finalizationAwards: Array.isArray(event.finalizationAwards) ? event.finalizationAwards : [],
+  };
+}
+
+function normalizeBuildathonProject(project) {
+  const votes = Array.isArray(project.votes) ? project.votes : [];
+  const voteCountRaw = Number(project.voteCount);
+  const voteCount = Number.isFinite(voteCountRaw) ? voteCountRaw : votes.length;
+  const projectStatus = getCanonicalProjectStatus(project);
+
+  return {
+    ...project,
+    votes,
+    voteCount,
+    projectStatus,
+    moderationStatus: getModerationStatusFromProjectStatus(projectStatus),
+    moderationNote: project.moderationNote || '',
+    isPublished: projectStatus === 'publie' ? true : project.isPublished === true,
+    isPublic: projectStatus === 'publie' ? true : project.isPublic === true,
+    likesCount: Number.isFinite(Number(project.likesCount)) ? Number(project.likesCount) : 0,
+    commentsCount: Number.isFinite(Number(project.commentsCount)) ? Number(project.commentsCount) : 0,
+    feedbackCount: Number.isFinite(Number(project.feedbackCount)) ? Number(project.feedbackCount) : 0,
+    likeUserIds: Array.isArray(project.likeUserIds) ? project.likeUserIds : [],
+  };
+}
+
+function toTimestampMs(value) {
+  if (!value) return null;
+  if (typeof value === 'number' && Number.isFinite(value)) return value;
+  if (value?.toDate && typeof value.toDate === 'function') {
+    const d = value.toDate();
+    const t = d.getTime();
+    return Number.isNaN(t) ? null : t;
+  }
+  const d = new Date(value);
+  const t = d.getTime();
+  return Number.isNaN(t) ? null : t;
+}
+
+function getProjectSubmissionTimestamp(project) {
+  const submittedAt = toTimestampMs(project?.submittedAt);
+  if (submittedAt !== null) return submittedAt;
+
+  const createdAt = toTimestampMs(project?.createdAt);
+  if (createdAt !== null) return createdAt;
+
+  // Backward compatibility: unknown submission time should rank after known dates.
+  return Number.MAX_SAFE_INTEGER;
+}
+
+function formatProjectSubmittedAt(value) {
+  if (!value) return 'Non defini';
+  const d = new Date(value);
+  if (Number.isNaN(d.getTime())) return 'Non defini';
+  return d.toLocaleString('fr-FR', {
+    day: '2-digit',
+    month: '2-digit',
+    year: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit',
+  });
+}
+
+function compareProjectsForRanking(a, b) {
+  const voteDiff = (b?.voteCount || 0) - (a?.voteCount || 0);
+  if (voteDiff !== 0) return voteDiff;
+
+  const timeDiff = getProjectSubmissionTimestamp(a) - getProjectSubmissionTimestamp(b);
+  if (timeDiff !== 0) return timeDiff;
+
+  // Stable final fallback for deterministic ordering when data is incomplete.
+  return String(a?.id || '').localeCompare(String(b?.id || ''));
+}
+
+function compareProjectsForJudgeRanking(a, b) {
+  const judgeDiff = Number(b?.judgeScoreAverage || 0) - Number(a?.judgeScoreAverage || 0);
+  if (judgeDiff !== 0) return judgeDiff;
+
+  const timeDiff = getProjectSubmissionTimestamp(a) - getProjectSubmissionTimestamp(b);
+  if (timeDiff !== 0) return timeDiff;
+
+  return String(a?.id || '').localeCompare(String(b?.id || ''));
+}
+
+function sortProjectsForRanking(projectList = []) {
+  return [...projectList].sort(compareProjectsForRanking);
+}
+
+function sortProjectsForEventRanking(event, projectList = []) {
+  const rankingMode = event?.juryModeEnabled === true || event?.rankingMode === 'jury' ? 'jury' : 'public';
+  return rankingMode === 'jury'
+    ? [...projectList].sort(compareProjectsForJudgeRanking)
+    : [...projectList].sort(compareProjectsForRanking);
+}
+
 export default function Buildathon() {
   const { user, userProfile, isAdmin } = useAuth();
   const [events, setEvents] = useState([]);
@@ -121,6 +402,8 @@ export default function Buildathon() {
   const [searchQuery, setSearchQuery] = useState('');
   const [expandedEvent, setExpandedEvent] = useState(null);
   const [filterStatus, setFilterStatus] = useState('all');
+  const [filterDate, setFilterDate] = useState('all');
+  const [filterPopularity, setFilterPopularity] = useState('all');
 
   // Admin: create event
   const [showCreateEvent, setShowCreateEvent] = useState(false);
@@ -128,11 +411,13 @@ export default function Buildathon() {
     type: 'buildathon',
     title: '',
     description: '',
+    status: 'active',
     startDate: '',
     endDate: '',
     workDuration: '',
     maxTeamSize: 4,
     prizes: DEFAULT_PRIZES,
+    ...DEFAULT_BUILDATHON_CONFIG,
   });
   const [showEditEvent, setShowEditEvent] = useState(false);
   const [editingEventId, setEditingEventId] = useState(null);
@@ -140,11 +425,13 @@ export default function Buildathon() {
     type: 'buildathon',
     title: '',
     description: '',
+    status: 'active',
     startDate: '',
     endDate: '',
     workDuration: '',
     maxTeamSize: 4,
     prizes: DEFAULT_PRIZES,
+    ...DEFAULT_BUILDATHON_CONFIG,
   });
 
   // User: submit project
@@ -170,13 +457,14 @@ export default function Buildathon() {
     demoUrl: '',
   });
   const [invitations, setInvitations] = useState([]);
+  const [moderationNotes, setModerationNotes] = useState({});
 
   useEffect(() => {
     const unsubEvents = onSnapshot(
       query(collection(db, 'buildathons'), orderBy('createdAt', 'desc')),
       (snap) => {
         const data = [];
-        snap.forEach((d) => data.push({ id: d.id, ...d.data() }));
+        snap.forEach((d) => data.push(normalizeBuildathonEvent({ id: d.id, ...d.data() })));
         setEvents(data);
         setLoading(false);
       },
@@ -187,7 +475,7 @@ export default function Buildathon() {
       collection(db, 'buildathonProjects'),
       (snap) => {
         const data = [];
-        snap.forEach((d) => data.push({ id: d.id, ...d.data() }));
+        snap.forEach((d) => data.push(normalizeBuildathonProject({ id: d.id, ...d.data() })));
         setProjects(data);
       },
       (err) => console.error('Projects error:', err),
@@ -225,21 +513,45 @@ export default function Buildathon() {
       await setDoc(doc(db, 'buildathons', id), {
         type: newEvent.type,
         title: newEvent.title,
-        description: newEvent.description,
+        shortDescription: (newEvent.shortDescription || '').trim(),
+        fullDescription: (newEvent.fullDescription || '').trim(),
+        description: (newEvent.fullDescription || newEvent.shortDescription || newEvent.description || '').trim(),
+        coverImageUrl: (newEvent.coverImageUrl || '').trim(),
+        status: newEvent.status || 'active',
         startDate: newEvent.startDate,
         endDate: newEvent.endDate,
+        submissionStartDate: normalizeDateLike(newEvent.submissionStartDate) || normalizeDateLike(newEvent.startDate),
+        submissionEndDate: normalizeDateLike(newEvent.submissionEndDate) || normalizeDateLike(newEvent.endDate),
         workDuration: newEvent.workDuration,
         maxTeamSize: Number(newEvent.maxTeamSize) || 4,
         prizes: normalizedPrizes,
+        votingEnabled: newEvent.votingEnabled !== false,
+        maxVotesPerUser: 1,
+        allowSelfVote: newEvent.allowSelfVote === true,
+        voteStartDate: normalizeDateLike(newEvent.voteStartDate) || normalizeDateLike(newEvent.startDate),
+        voteEndDate: normalizeDateLike(newEvent.voteEndDate) || normalizeDateLike(newEvent.endDate),
+        participationRules: (newEvent.participationRules || '').trim(),
+        evaluationCriteria: (newEvent.evaluationCriteria || '').trim(),
+        tieBreakRuleText: (newEvent.tieBreakRuleText || '').trim() || 'En cas d\'égalité, le projet soumis le plus tôt est prioritaire.',
+        rewardsVisible: newEvent.rewardsVisible !== false,
+        projectVisibility: newEvent.projectVisibility || 'published-only',
+        submissionOpen: newEvent.submissionOpen !== false,
+        publicationStatus: newEvent.publicationStatus || 'published',
+        juryModeEnabled: newEvent.juryModeEnabled === true,
+        juryResultsPublished: newEvent.juryResultsPublished === true,
+        rankingMode: newEvent.juryModeEnabled ? 'jury' : 'public',
+        judgeCriteria: Array.isArray(newEvent.judgeCriteria) ? newEvent.judgeCriteria : [],
         participants: [],
-        status: 'active',
         createdBy: user.uid,
         createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+        archivedAt: null,
+        publishedAt: serverTimestamp(),
         finalized: false,
       });
       toast.success(`${newEvent.type === 'hackathon' ? 'Hackathon' : 'Buildathon'} créé !`);
       setShowCreateEvent(false);
-      setNewEvent({ type: 'buildathon', title: '', description: '', startDate: '', endDate: '', workDuration: '', maxTeamSize: 4, prizes: DEFAULT_PRIZES });
+      setNewEvent({ type: 'buildathon', title: '', description: '', status: 'active', startDate: '', endDate: '', workDuration: '', maxTeamSize: 4, prizes: DEFAULT_PRIZES, ...DEFAULT_BUILDATHON_CONFIG });
     } catch (err) {
       toast.error('Erreur: ' + err.message);
     }
@@ -252,10 +564,31 @@ export default function Buildathon() {
       type: event.type || 'buildathon',
       title: event.title || '',
       description: event.description || '',
+      shortDescription: event.shortDescription || '',
+      fullDescription: event.fullDescription || event.description || '',
+      coverImageUrl: event.coverImageUrl || '',
+      status: event.status || 'active',
       startDate: toInputDateTime(event.startDate),
       endDate: toInputDateTime(event.endDate),
+      submissionStartDate: toInputDateTime(event.submissionStartDate || event.startDate),
+      submissionEndDate: toInputDateTime(event.submissionEndDate || event.endDate),
       workDuration: event.workDuration || '',
       maxTeamSize: Number(event.maxTeamSize) || 4,
+      votingEnabled: event.votingEnabled !== false,
+      maxVotesPerUser: 1,
+      allowSelfVote: event.allowSelfVote === true,
+      voteStartDate: toInputDateTime(event.voteStartDate || event.startDate),
+      voteEndDate: toInputDateTime(event.voteEndDate || event.endDate),
+      participationRules: event.participationRules || '',
+      evaluationCriteria: event.evaluationCriteria || '',
+      tieBreakRuleText: event.tieBreakRuleText || 'En cas d\'égalité, le projet soumis le plus tôt est prioritaire.',
+      rewardsVisible: event.rewardsVisible !== false,
+      projectVisibility: event.projectVisibility || 'published-only',
+      submissionOpen: event.submissionOpen !== false,
+      publicationStatus: event.publicationStatus || 'published',
+      juryModeEnabled: event.juryModeEnabled === true,
+      juryResultsPublished: event.juryResultsPublished === true,
+      judgeCriteria: Array.isArray(event.judgeCriteria) ? event.judgeCriteria : [],
       prizes: (event.prizes && event.prizes.length > 0)
         ? [...event.prizes]
             .sort((a, b) => a.place - b.place)
@@ -284,12 +617,34 @@ export default function Buildathon() {
       await updateDoc(doc(db, 'buildathons', editingEventId), {
         type: editEvent.type,
         title: editEvent.title,
-        description: editEvent.description,
+        shortDescription: (editEvent.shortDescription || '').trim(),
+        fullDescription: (editEvent.fullDescription || '').trim(),
+        description: (editEvent.fullDescription || editEvent.shortDescription || editEvent.description || '').trim(),
+        coverImageUrl: (editEvent.coverImageUrl || '').trim(),
+        status: editEvent.status || 'active',
         startDate: editEvent.startDate,
         endDate: editEvent.endDate,
+        submissionStartDate: normalizeDateLike(editEvent.submissionStartDate) || normalizeDateLike(editEvent.startDate),
+        submissionEndDate: normalizeDateLike(editEvent.submissionEndDate) || normalizeDateLike(editEvent.endDate),
         workDuration: editEvent.workDuration,
         maxTeamSize: Number(editEvent.maxTeamSize) || 4,
         prizes: normalizedPrizes,
+        votingEnabled: editEvent.votingEnabled !== false,
+        maxVotesPerUser: 1,
+        allowSelfVote: editEvent.allowSelfVote === true,
+        voteStartDate: normalizeDateLike(editEvent.voteStartDate) || normalizeDateLike(editEvent.startDate),
+        voteEndDate: normalizeDateLike(editEvent.voteEndDate) || normalizeDateLike(editEvent.endDate),
+        participationRules: (editEvent.participationRules || '').trim(),
+        evaluationCriteria: (editEvent.evaluationCriteria || '').trim(),
+        tieBreakRuleText: (editEvent.tieBreakRuleText || '').trim() || 'En cas d\'égalité, le projet soumis le plus tôt est prioritaire.',
+        rewardsVisible: editEvent.rewardsVisible !== false,
+        projectVisibility: editEvent.projectVisibility || 'published-only',
+        submissionOpen: editEvent.submissionOpen !== false,
+        publicationStatus: editEvent.publicationStatus || 'published',
+        juryModeEnabled: editEvent.juryModeEnabled === true,
+        juryResultsPublished: editEvent.juryResultsPublished === true,
+        rankingMode: editEvent.juryModeEnabled ? 'jury' : 'public',
+        judgeCriteria: Array.isArray(editEvent.judgeCriteria) ? editEvent.judgeCriteria : [],
         updatedAt: serverTimestamp(),
         updatedBy: user.uid,
       });
@@ -342,6 +697,14 @@ export default function Buildathon() {
       toast.error('Complétez utilisateur, titre, équipe, GitHub et démo');
       return;
     }
+    if (!isValidGitHubRepoUrl(adminProject.repoUrl)) {
+      toast.error('Le lien GitHub doit être un dépôt valide (https://github.com/owner/repo)');
+      return;
+    }
+    if (!isValidDemoUrl(adminProject.demoUrl)) {
+      toast.error('Le lien démo doit être une URL HTTPS valide');
+      return;
+    }
     try {
       const targetUser = await resolveUserByIdentifier(adminProject.userIdentifier);
       if (!targetUser?.uid) {
@@ -356,11 +719,26 @@ export default function Buildathon() {
         description: adminProject.description,
         category: adminProject.category,
         teamName: adminProject.teamName,
-        repoUrl: adminProject.repoUrl,
-        demoUrl: adminProject.demoUrl,
+        repoUrl: adminProject.repoUrl.trim(),
+        demoUrl: adminProject.demoUrl.trim(),
         members: [{ uid: targetUser.uid, name: targetUser.name, email: targetUser.email }],
         votes: [],
         voteCount: 0,
+        likesCount: 0,
+        commentsCount: 0,
+        feedbackCount: 0,
+        likeUserIds: [],
+        projectStatus: 'publie',
+        moderationStatus: 'approved',
+        moderationNote: '',
+        isPublished: true,
+        isPublic: true,
+        validatedAt: serverTimestamp(),
+        validatedBy: user.uid,
+        rejectedAt: null,
+        rejectedBy: null,
+        publishedAt: serverTimestamp(),
+        publishedBy: user.uid,
         submittedBy: targetUser.uid,
         submittedAt: serverTimestamp(),
       });
@@ -369,6 +747,109 @@ export default function Buildathon() {
       toast.success(`Projet ajouté pour ${targetUser.name}`);
       setShowAdminProjectForm(null);
       setAdminProject({ userIdentifier: '', title: '', description: '', category: 'web', teamName: '', repoUrl: '', demoUrl: '' });
+    } catch (err) {
+      toast.error('Erreur: ' + err.message);
+    }
+  }
+
+  async function handleGrantProjectBonus(eventId, projectId, rankIndex) {
+    if (!isAdmin || !user?.uid) return;
+    const event = events.find((e) => e.id === eventId);
+    const project = projects.find((p) => p.id === projectId);
+    if (!event || !project || project.manualPrizeGrantedAt) return;
+
+    const sortedPrizes = [...(event.prizes || [])].sort((a, b) => a.place - b.place);
+    const prize = sortedPrizes[rankIndex];
+    if (!prize || (prize.rewardType || 'points') !== 'points') return;
+
+    const totalPoints = Number(prize.points || 0);
+    if (totalPoints <= 0) return;
+
+    const memberCount = project.members?.length || 1;
+    const pointsPerMember = Math.round(totalPoints / memberCount);
+    if (pointsPerMember <= 0) return;
+
+    try {
+      const grantedEntries = [];
+      for (const member of project.members || []) {
+        if (!member.uid) continue;
+        const userRef = doc(db, 'users', member.uid);
+        await updateDoc(userRef, { bonusPoints: increment(pointsPerMember) });
+        const logRef = doc(collection(db, 'users', member.uid, 'bonusLogs'));
+        await setDoc(logRef, {
+          points: pointsPerMember,
+          reason: `${event.type === 'hackathon' ? 'Hackathon' : 'Buildathon'} "${event.title}" - Attribution manuelle place ${rankIndex + 1} (${totalPoints} pts à ${memberCount} membre${memberCount > 1 ? 's' : ''})`,
+          grantedBy: user.uid,
+          grantedAt: serverTimestamp(),
+          source: 'buildathon-manual-bonus',
+          buildathonId: eventId,
+          projectId,
+        });
+        grantedEntries.push({ uid: member.uid, points: pointsPerMember });
+      }
+
+      await updateDoc(doc(db, 'buildathonProjects', projectId), {
+        manualPrizeGrantedAt: serverTimestamp(),
+        manualPrizeGrantedBy: user.uid,
+        manualPrizeGrantedPoints: totalPoints,
+        manualPrizeLogEntries: grantedEntries,
+        manualPrizeRevokedAt: null,
+        manualPrizeRevokedBy: null,
+      });
+      toast.success(`Bonus attribué: +${totalPoints} pts`);
+    } catch (err) {
+      toast.error('Erreur: ' + err.message);
+    }
+  }
+
+  async function handleRevokeProjectBonus(eventId, projectId, rankIndex) {
+    if (!isAdmin || !user?.uid) return;
+    const event = events.find((e) => e.id === eventId);
+    const project = projects.find((p) => p.id === projectId);
+    if (!event || !project || !project.manualPrizeGrantedAt) return;
+
+    const savedEntries = Array.isArray(project.manualPrizeLogEntries) ? project.manualPrizeLogEntries : [];
+    let entriesToRevoke = savedEntries.filter((entry) => entry?.uid && Number(entry?.points) > 0);
+
+    if (entriesToRevoke.length === 0) {
+      const sortedPrizes = [...(event.prizes || [])].sort((a, b) => a.place - b.place);
+      const prize = sortedPrizes[rankIndex];
+      const totalPoints = Number(prize?.points || 0);
+      const memberCount = project.members?.length || 1;
+      const pointsPerMember = Math.round(totalPoints / memberCount);
+      if (pointsPerMember <= 0) {
+        toast.error('Impossible de calculer les points à retirer');
+        return;
+      }
+      entriesToRevoke = (project.members || [])
+        .filter((member) => member?.uid)
+        .map((member) => ({ uid: member.uid, points: pointsPerMember }));
+    }
+
+    try {
+      for (const entry of entriesToRevoke) {
+        await updateDoc(doc(db, 'users', entry.uid), { bonusPoints: increment(-Math.abs(Number(entry.points || 0))) });
+        const logRef = doc(collection(db, 'users', entry.uid, 'bonusLogs'));
+        await setDoc(logRef, {
+          points: -Math.abs(Number(entry.points || 0)),
+          reason: `${event.type === 'hackathon' ? 'Hackathon' : 'Buildathon'} "${event.title}" - Annulation bonus manuel`,
+          grantedBy: user.uid,
+          grantedAt: serverTimestamp(),
+          source: 'buildathon-manual-bonus-revoke',
+          buildathonId: eventId,
+          projectId,
+        });
+      }
+
+      await updateDoc(doc(db, 'buildathonProjects', projectId), {
+        manualPrizeGrantedAt: null,
+        manualPrizeGrantedBy: null,
+        manualPrizeGrantedPoints: 0,
+        manualPrizeLogEntries: [],
+        manualPrizeRevokedAt: serverTimestamp(),
+        manualPrizeRevokedBy: user.uid,
+      });
+      toast.success('Bonus manuel annulé');
     } catch (err) {
       toast.error('Erreur: ' + err.message);
     }
@@ -391,6 +872,63 @@ export default function Buildathon() {
       toast.success('Événement supprimé');
     } catch (err) {
       toast.error('Erreur: ' + err.message);
+    }
+  }
+
+  async function handleModerateProject(project, targetStatus) {
+    if (!isAdmin || !user?.uid || !project?.id) return;
+    if (!PROJECT_STATUSES.includes(targetStatus)) return;
+
+    const currentStatus = getCanonicalProjectStatus(project);
+    if (currentStatus === targetStatus) return;
+
+    if (targetStatus === 'publie' && currentStatus !== 'valide') {
+      toast.error('Un projet doit etre valide avant publication');
+      return;
+    }
+
+    const note = (moderationNotes[project.id] ?? project.moderationNote ?? '').trim();
+    const payload = {
+      projectStatus: targetStatus,
+      moderationStatus: getModerationStatusFromProjectStatus(targetStatus),
+      moderationNote: note,
+      updatedAt: serverTimestamp(),
+      moderatedBy: user.uid,
+      moderatedAt: serverTimestamp(),
+      isPublished: targetStatus === 'publie',
+      isPublic: targetStatus === 'publie',
+    };
+
+    if (targetStatus === 'valide') {
+      payload.validatedAt = serverTimestamp();
+      payload.validatedBy = user.uid;
+      payload.rejectedAt = null;
+      payload.rejectedBy = null;
+      if (currentStatus === 'publie') {
+        payload.publishedAt = null;
+        payload.publishedBy = null;
+      }
+    }
+
+    if (targetStatus === 'rejete') {
+      payload.rejectedAt = serverTimestamp();
+      payload.rejectedBy = user.uid;
+      payload.publishedAt = null;
+      payload.publishedBy = null;
+    }
+
+    if (targetStatus === 'publie') {
+      payload.publishedAt = serverTimestamp();
+      payload.publishedBy = user.uid;
+      payload.validatedAt = project.validatedAt || serverTimestamp();
+      payload.validatedBy = project.validatedBy || user.uid;
+    }
+
+    try {
+      await updateDoc(doc(db, 'buildathonProjects', project.id), payload);
+      toast.success(`Projet passe a l'etat ${getProjectStatusBadge(targetStatus).label}`);
+    } catch (err) {
+      toast.error('Erreur moderation: ' + err.message);
     }
   }
 
@@ -418,6 +956,14 @@ export default function Buildathon() {
       toast.error('Le lien vidéo démo est obligatoire');
       return;
     }
+    if (!isValidGitHubRepoUrl(newProject.repoUrl)) {
+      toast.error('Le lien GitHub doit être un dépôt valide (https://github.com/owner/repo)');
+      return;
+    }
+    if (!isValidDemoUrl(newProject.demoUrl)) {
+      toast.error('Le lien vidéo démo doit être une URL HTTPS valide');
+      return;
+    }
     try {
       const id = `project-${Date.now().toString(36)}-${user.uid.slice(0, 6)}`;
       await setDoc(doc(db, 'buildathonProjects', id), {
@@ -426,11 +972,26 @@ export default function Buildathon() {
         description: newProject.description,
         category: newProject.category,
         teamName: newProject.teamName,
-        repoUrl: newProject.repoUrl,
-        demoUrl: newProject.demoUrl,
+        repoUrl: newProject.repoUrl.trim(),
+        demoUrl: newProject.demoUrl.trim(),
         members: [{ uid: user.uid, name: userProfile?.displayName || user.email, email: user.email }],
         votes: [],
         voteCount: 0,
+        likesCount: 0,
+        commentsCount: 0,
+        feedbackCount: 0,
+        likeUserIds: [],
+        projectStatus: DEFAULT_BUILDATHON_PROJECT_META.projectStatus,
+        moderationStatus: DEFAULT_BUILDATHON_PROJECT_META.moderationStatus,
+        moderationNote: DEFAULT_BUILDATHON_PROJECT_META.moderationNote,
+        isPublished: DEFAULT_BUILDATHON_PROJECT_META.isPublished,
+        isPublic: DEFAULT_BUILDATHON_PROJECT_META.isPublic,
+        validatedAt: DEFAULT_BUILDATHON_PROJECT_META.validatedAt,
+        validatedBy: DEFAULT_BUILDATHON_PROJECT_META.validatedBy,
+        rejectedAt: DEFAULT_BUILDATHON_PROJECT_META.rejectedAt,
+        rejectedBy: DEFAULT_BUILDATHON_PROJECT_META.rejectedBy,
+        publishedAt: DEFAULT_BUILDATHON_PROJECT_META.publishedAt,
+        publishedBy: DEFAULT_BUILDATHON_PROJECT_META.publishedBy,
         submittedBy: user.uid,
         submittedAt: serverTimestamp(),
       });
@@ -458,11 +1019,50 @@ export default function Buildathon() {
 
     try {
       const projRef = doc(db, 'buildathonProjects', projectId);
-      if (hasVoted) {
-        await updateDoc(projRef, { votes: arrayRemove(user.uid), voteCount: increment(-1) });
+      const voteLockRef = doc(db, 'buildathons', buildathonId, 'votes', user.uid);
+      const result = await runTransaction(db, async (tx) => {
+        const snap = await tx.get(projRef);
+        if (!snap.exists()) throw new Error('Projet introuvable');
+        const voteLockSnap = await tx.get(voteLockRef);
+
+        const data = snap.data() || {};
+        const votes = Array.isArray(data.votes) ? data.votes : [];
+        const alreadyVoted = votes.includes(user.uid);
+        const lockedProjectId = voteLockSnap.exists() ? voteLockSnap.data()?.projectId : null;
+
+        if (alreadyVoted) {
+          const nextVotes = votes.filter((uid) => uid !== user.uid);
+          tx.update(projRef, {
+            votes: nextVotes,
+            voteCount: nextVotes.length,
+            updatedAt: serverTimestamp(),
+          });
+          tx.delete(voteLockRef);
+          return { action: 'removed' };
+        }
+
+        if (lockedProjectId && lockedProjectId !== projectId) {
+          throw new Error('Vous ne pouvez voter que pour un seul projet par événement');
+        }
+
+        const nextVotes = [...votes, user.uid];
+        tx.update(projRef, {
+          votes: nextVotes,
+          voteCount: nextVotes.length,
+          updatedAt: serverTimestamp(),
+        });
+        tx.set(voteLockRef, {
+          projectId,
+          buildathonId,
+          userId: user.uid,
+          updatedAt: serverTimestamp(),
+        });
+        return { action: 'added' };
+      });
+
+      if (result.action === 'removed') {
         toast.success('Vote retiré');
       } else {
-        await updateDoc(projRef, { votes: arrayUnion(user.uid), voteCount: increment(1) });
         toast.success('Vote enregistré ! (+10 pts pour ce projet)');
       }
     } catch (err) {
@@ -470,14 +1070,29 @@ export default function Buildathon() {
     }
   }
 
-  // ---- Admin: Finalize Event (points divided among team members) ----
-  async function handleFinalize(eventId, autoMode = false) {
+  // ---- Admin: Finalize Event (manual confirmation only) ----
+  async function handleFinalize(eventId) {
+    if (!isAdmin || !user?.uid) return;
     const event = events.find((e) => e.id === eventId);
     if (!event || event.finalized) return;
-    const eventProjects = projects.filter((p) => p.buildathonId === eventId).sort((a, b) => (b.voteCount || 0) - (a.voteCount || 0));
-    if (eventProjects.length === 0) { if (!autoMode) toast.error('Aucun projet soumis'); return; }
+
+    const status = getEventStatus(event);
+    if (status !== 'ended' && status !== 'completed') {
+      toast.error('Attribution impossible: attendez la fin du challenge');
+      return;
+    }
+
+    if (!confirm('Confirmer l\'attribution finale des points ?')) return;
+
+    const eventProjects = sortProjectsForEventRanking(event, projects.filter((p) => p.buildathonId === eventId));
+    if (eventProjects.length === 0) {
+      toast.error('Aucun projet soumis');
+      return;
+    }
+
     const prizes = (event.prizes || []).sort((a, b) => a.place - b.place);
     try {
+      const finalizationAwards = [];
       for (let i = 0; i < Math.min(prizes.length, eventProjects.length); i++) {
         const project = eventProjects[i];
         const prize = prizes[i];
@@ -493,18 +1108,106 @@ export default function Buildathon() {
             const logRef = doc(collection(db, 'users', member.uid, 'bonusLogs'));
             await setDoc(logRef, {
               points: pointsPerMember,
-              reason: `${event.type === 'hackathon' ? 'Hackathon' : 'Buildathon'} "${event.title}" - Place ${prize.place} (${totalPoints} pts ÷ ${memberCount} membre${memberCount > 1 ? 's' : ''})`,
-              grantedBy: autoMode ? 'system' : user.uid,
+              reason: `${event.type === 'hackathon' ? 'Hackathon' : 'Buildathon'} "${event.title}" - Place ${prize.place} (${totalPoints} pts à ${memberCount} membre${memberCount > 1 ? 's' : ''})`,
+              grantedBy: user.uid,
               grantedAt: serverTimestamp(),
+              source: 'buildathon-finalize',
+              buildathonId: eventId,
+              projectId: project.id,
+              place: prize.place,
+            });
+            finalizationAwards.push({
+              uid: member.uid,
+              projectId: project.id,
+              place: prize.place,
+              points: pointsPerMember,
             });
           }
         }
       }
-      await updateDoc(doc(db, 'buildathons', eventId), { status: 'completed', finalized: true, finalizedAt: serverTimestamp(), finalizedBy: autoMode ? 'system' : user.uid });
-      if (!autoMode) toast.success('Événement finalisé ! Points bonus répartis entre les membres.');
+
+      await updateDoc(doc(db, 'buildathons', eventId), {
+        status: 'completed',
+        finalized: true,
+        finalizedAt: serverTimestamp(),
+        finalizedBy: user.uid,
+        finalizationAwards,
+        finalizationRevokedAt: null,
+        finalizationRevokedBy: null,
+      });
+      toast.success('Attribution finale effectuée');
     } catch (err) {
-      if (!autoMode) toast.error('Erreur: ' + err.message);
+      toast.error('Erreur: ' + err.message);
       console.error('Finalize error:', err);
+    }
+  }
+
+  async function handleRevokeFinalization(eventId) {
+    if (!isAdmin || !user?.uid) return;
+    const event = events.find((e) => e.id === eventId);
+    if (!event || !event.finalized) return;
+    if (!confirm('Annuler les points attribués pour cet événement ?')) return;
+
+    let awardsToRevoke = Array.isArray(event.finalizationAwards)
+      ? event.finalizationAwards.filter((award) => award?.uid && Number(award?.points) > 0)
+      : [];
+
+    if (awardsToRevoke.length === 0) {
+      const eventProjects = sortProjectsForEventRanking(event, projects.filter((p) => p.buildathonId === eventId));
+      const prizes = (event.prizes || []).sort((a, b) => a.place - b.place);
+      awardsToRevoke = [];
+
+      for (let i = 0; i < Math.min(prizes.length, eventProjects.length); i++) {
+        const project = eventProjects[i];
+        const prize = prizes[i];
+        if ((prize.rewardType || 'points') !== 'points') continue;
+        const memberCount = project.members?.length || 1;
+        const totalPoints = Number(prize.points || 0);
+        const pointsPerMember = Math.round(totalPoints / memberCount);
+        if (pointsPerMember <= 0) continue;
+
+        for (const member of project.members || []) {
+          if (!member.uid) continue;
+          awardsToRevoke.push({
+            uid: member.uid,
+            projectId: project.id,
+            place: prize.place,
+            points: pointsPerMember,
+          });
+        }
+      }
+    }
+
+    try {
+      for (const award of awardsToRevoke) {
+        await updateDoc(doc(db, 'users', award.uid), {
+          bonusPoints: increment(-Math.abs(Number(award.points || 0))),
+        });
+        const logRef = doc(collection(db, 'users', award.uid, 'bonusLogs'));
+        await setDoc(logRef, {
+          points: -Math.abs(Number(award.points || 0)),
+          reason: `${event.type === 'hackathon' ? 'Hackathon' : 'Buildathon'} "${event.title}" - Annulation attribution finale`,
+          grantedBy: user.uid,
+          grantedAt: serverTimestamp(),
+          source: 'buildathon-finalize-revoke',
+          buildathonId: eventId,
+          projectId: award.projectId || null,
+          place: award.place || null,
+        });
+      }
+
+      await updateDoc(doc(db, 'buildathons', eventId), {
+        status: 'ended',
+        finalized: false,
+        finalizedAt: null,
+        finalizedBy: null,
+        finalizationRevokedAt: serverTimestamp(),
+        finalizationRevokedBy: user.uid,
+      });
+
+      toast.success('Attribution annulée, points retirés');
+    } catch (err) {
+      toast.error('Erreur: ' + err.message);
     }
   }
 
@@ -602,32 +1305,172 @@ export default function Buildathon() {
     return () => unsubSent();
   }, [user?.uid]);
 
-  // ---- Auto-finalize: when an event has ended, automatically finalize & distribute points ----
-  useEffect(() => {
-    if (!events.length || !projects.length || loading) return;
-    events.forEach((event) => {
-      const status = getEventStatus(event);
-      if (status === 'ended' && !event.finalized) {
-        const eventProjects = projects.filter((p) => p.buildathonId === event.id);
-        if (eventProjects.length > 0) {
-          handleFinalize(event.id, true);
-        }
+  function getSafeDate(value) {
+    if (!value) return null;
+    const d = new Date(value);
+    return Number.isNaN(d.getTime()) ? null : d;
+  }
+
+  function getEventDateCategory(event) {
+    const now = new Date();
+    const start = getSafeDate(event.startDate);
+    const end = getSafeDate(event.endDate);
+
+    if (!start && !end) return 'undated';
+    if (end && end < now) return 'past';
+
+    const upcomingWindow = new Date(now);
+    upcomingWindow.setDate(upcomingWindow.getDate() + 30);
+    if (start && start >= now && start <= upcomingWindow) return 'upcoming-30';
+
+    const currentYear = now.getFullYear();
+    const currentMonth = now.getMonth();
+    const startsThisMonth = start && start.getFullYear() === currentYear && start.getMonth() === currentMonth;
+    const endsThisMonth = end && end.getFullYear() === currentYear && end.getMonth() === currentMonth;
+    if (startsThisMonth || endsThisMonth) return 'this-month';
+
+    return 'all';
+  }
+
+  function getEventPopularityMetrics(eventId, eventParticipants = []) {
+    const eventProjects = projects.filter((p) => p.buildathonId === eventId);
+    const submittedProjects = eventProjects.length;
+    const participantsCount = Array.isArray(eventParticipants) ? eventParticipants.length : 0;
+    const totalVotes = eventProjects.reduce((sum, p) => sum + (p.voteCount || 0), 0);
+    const popularityScore = (submittedProjects * 3) + participantsCount + totalVotes;
+
+    return { submittedProjects, participantsCount, totalVotes, popularityScore };
+  }
+
+  function getSafeCountFromPair(primary, secondary) {
+    const primaryCount = Number(primary);
+    const secondaryCount = Number(secondary);
+    const safePrimary = Number.isFinite(primaryCount) ? primaryCount : 0;
+    const safeSecondary = Number.isFinite(secondaryCount) ? secondaryCount : 0;
+    return Math.max(safePrimary, safeSecondary);
+  }
+
+  function getBuildathonSupervisionMetrics(event, eventProjects = []) {
+    const participantsCount = Array.isArray(event?.participants) ? event.participants.length : 0;
+    const submittedProjects = eventProjects.length;
+
+    let publishedProjects = 0;
+    let rejectedProjects = 0;
+    let totalVotes = 0;
+    let totalLikes = 0;
+    let totalFeedback = 0;
+
+    const uniqueTeamNames = new Set();
+
+    eventProjects.forEach((project) => {
+      const status = getCanonicalProjectStatus(project);
+      if (status === 'publie') publishedProjects += 1;
+      if (status === 'rejete') rejectedProjects += 1;
+
+      const voteCount = Number.isFinite(Number(project?.voteCount))
+        ? Number(project.voteCount)
+        : (Array.isArray(project?.votes) ? project.votes.length : 0);
+      const likesCount = Number.isFinite(Number(project?.likesCount))
+        ? Number(project.likesCount)
+        : (Array.isArray(project?.likeUserIds) ? project.likeUserIds.length : 0);
+
+      totalVotes += voteCount;
+      totalLikes += likesCount;
+      totalFeedback += getSafeCountFromPair(project?.feedbackCount, project?.commentsCount);
+
+      const teamName = (project?.teamName || '').trim();
+      if (teamName) {
+        uniqueTeamNames.add(teamName.toLowerCase());
       }
     });
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [events, projects, loading]);
+
+    return {
+      submittedProjects,
+      publishedProjects,
+      rejectedProjects,
+      totalVotes,
+      totalLikes,
+      totalFeedback,
+      participantsCount,
+      teamsCount: uniqueTeamNames.size > 0 ? uniqueTeamNames.size : submittedProjects,
+      votingEnabled: event?.votingEnabled !== false,
+      submissionOpen: event?.submissionOpen !== false,
+    };
+  }
+
+  function getProjectIntegrityWarnings(project) {
+    const warnings = [];
+    const status = getCanonicalProjectStatus(project);
+    const title = (project?.title || '').trim();
+    const teamName = (project?.teamName || '').trim();
+    const hasRepo = Boolean((project?.repoUrl || '').trim());
+    const hasDemo = Boolean((project?.demoUrl || '').trim());
+
+    if (!title) warnings.push('Titre manquant');
+    if (!teamName) warnings.push('Equipe manquante');
+    if (!hasRepo) warnings.push('Repo manquant');
+    if (!hasDemo) warnings.push('Demo manquante');
+
+    const submittedAtMs = toTimestampMs(project?.submittedAt);
+    const createdAtMs = toTimestampMs(project?.createdAt);
+    if (submittedAtMs === null && createdAtMs === null) {
+      warnings.push('submittedAt/createdAt manquant');
+    }
+
+    if (status === 'publie' && (project?.isPublished !== true || project?.isPublic !== true)) {
+      warnings.push('Statut publie mais flags public/published incoherents');
+    }
+
+    if (status !== 'publie' && (project?.isPublished === true || project?.isPublic === true)) {
+      warnings.push('Flags public/published actifs hors statut publie');
+    }
+
+    const voteCount = Number.isFinite(Number(project?.voteCount)) ? Number(project.voteCount) : 0;
+    const votesLength = Array.isArray(project?.votes) ? project.votes.length : 0;
+    if (Number.isFinite(Number(project?.voteCount)) && Array.isArray(project?.votes) && voteCount !== votesLength) {
+      warnings.push('voteCount different de votes.length');
+    }
+
+    const likesCount = Number.isFinite(Number(project?.likesCount)) ? Number(project.likesCount) : 0;
+    const likeUserIdsLength = Array.isArray(project?.likeUserIds) ? project.likeUserIds.length : 0;
+    if (Number.isFinite(Number(project?.likesCount)) && Array.isArray(project?.likeUserIds) && likesCount !== likeUserIdsLength) {
+      warnings.push('likesCount different de likeUserIds.length');
+    }
+
+    const commentsCount = Number.isFinite(Number(project?.commentsCount)) ? Number(project.commentsCount) : 0;
+    const feedbackCount = Number.isFinite(Number(project?.feedbackCount)) ? Number(project.feedbackCount) : 0;
+    if (commentsCount > 0 && feedbackCount > 0 && Math.abs(commentsCount - feedbackCount) > 3) {
+      warnings.push('Ecart notable entre commentsCount et feedbackCount');
+    }
+
+    return warnings;
+  }
+
+  function getPopularityBucket(event) {
+    const { popularityScore } = getEventPopularityMetrics(event.id, event.participants);
+    if (popularityScore >= 20) return 'high';
+    if (popularityScore >= 8) return 'medium';
+    return 'low';
+  }
 
   const filteredEvents = useMemo(() => {
     return events.filter((e) => {
       const status = getEventStatus(e);
       if (filterStatus !== 'all' && status !== filterStatus) return false;
+
+      const dateCategory = getEventDateCategory(e);
+      if (filterDate !== 'all' && dateCategory !== filterDate) return false;
+
+      const popularityBucket = getPopularityBucket(e);
+      if (filterPopularity !== 'all' && popularityBucket !== filterPopularity) return false;
+
       if (searchQuery) {
         const q = searchQuery.toLowerCase();
         return e.title?.toLowerCase().includes(q) || e.description?.toLowerCase().includes(q);
       }
       return true;
     });
-  }, [events, filterStatus, searchQuery]);
+  }, [events, filterStatus, filterDate, filterPopularity, searchQuery, projects]);
 
   function CountdownTimer({ endDate }) {
     const [timeLeft, setTimeLeft] = useState('');
@@ -652,6 +1495,9 @@ export default function Buildathon() {
   if (loading) {
     return <div className="flex justify-center py-20"><Loader2 className="w-8 h-8 animate-spin text-primary-500" /></div>;
   }
+
+  const selectedSubmitEvent = events.find((e) => e.id === showSubmitProject);
+  const selectedAdminEvent = events.find((e) => e.id === showAdminProjectForm);
 
   return (
     <div className="max-w-6xl mx-auto animate-fade-in">
@@ -681,6 +1527,23 @@ export default function Buildathon() {
         <div className="flex gap-2 overflow-x-auto pb-1">
           {[{ value: 'all', label: 'Tous' }, { value: 'active', label: 'En cours' }, { value: 'upcoming', label: 'À venir' }, { value: 'ended', label: 'Vote' }, { value: 'completed', label: 'Passés' }].map(({ value, label }) => (
             <button key={value} onClick={() => setFilterStatus(value)} className={`px-3 py-1.5 rounded-lg text-sm font-medium whitespace-nowrap transition-all ${filterStatus === value ? 'bg-primary-600/20 text-primary-300 border border-primary-500/30' : 'text-body hover:text-heading hover:bg-black/5 dark:hover:bg-white/5'}`}>
+              {label}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      <div className="flex flex-col sm:flex-row gap-3 mb-6">
+        <div className="flex gap-2 overflow-x-auto pb-1">
+          {[{ value: 'all', label: 'Date: toutes' }, { value: 'upcoming-30', label: 'Date: 30 jours' }, { value: 'this-month', label: 'Date: ce mois' }, { value: 'past', label: 'Date: passés' }, { value: 'undated', label: 'Date: non définie' }].map(({ value, label }) => (
+            <button key={value} onClick={() => setFilterDate(value)} className={`px-3 py-1.5 rounded-lg text-sm font-medium whitespace-nowrap transition-all ${filterDate === value ? 'bg-primary-600/20 text-primary-300 border border-primary-500/30' : 'text-body hover:text-heading hover:bg-black/5 dark:hover:bg-white/5'}`}>
+              {label}
+            </button>
+          ))}
+        </div>
+        <div className="flex gap-2 overflow-x-auto pb-1">
+          {[{ value: 'all', label: 'Popularité: toutes' }, { value: 'high', label: 'Populaire' }, { value: 'medium', label: 'Intermédiaire' }, { value: 'low', label: 'Faible' }].map(({ value, label }) => (
+            <button key={value} onClick={() => setFilterPopularity(value)} className={`px-3 py-1.5 rounded-lg text-sm font-medium whitespace-nowrap transition-all ${filterPopularity === value ? 'bg-accent-600/20 text-accent-300 border border-accent-500/30' : 'text-body hover:text-heading hover:bg-black/5 dark:hover:bg-white/5'}`}>
               {label}
             </button>
           ))}
@@ -728,110 +1591,14 @@ export default function Buildathon() {
             <button onClick={() => setShowCreateEvent(false)} className="text-muted hover:text-heading"><X className="w-5 h-5" /></button>
           </div>
 
-          <form onSubmit={handleCreateEvent} className="space-y-4">
-            <div>
-              <label className="block text-sm font-medium text-body mb-2">Type d'événement *</label>
-              <div className="flex gap-3">
-                {EVENT_TYPES.map((t) => (
-                  <button key={t.value} type="button" onClick={() => setNewEvent((p) => ({ ...p, type: t.value }))} className={`flex items-center gap-2 px-4 py-3 rounded-xl border-2 transition-all ${newEvent.type === t.value ? 'border-primary-500 bg-primary-500/10 text-heading' : 'border-themed text-body hover:border-primary-500/50'}`}>
-                    <span className="text-xl">{t.icon}</span>
-                    <span className="font-medium">{t.label}</span>
-                  </button>
-                ))}
-              </div>
-            </div>
-
-            <div>
-              <label className="block text-sm font-medium text-body mb-1">Titre *</label>
-              <input type="text" value={newEvent.title} onChange={(e) => setNewEvent((p) => ({ ...p, title: e.target.value }))} className="input-field w-full" placeholder="Ex: Buildathon IA Mars 2026" required />
-            </div>
-
-            <div>
-              <label className="block text-sm font-medium text-body mb-1">Description</label>
-              <textarea value={newEvent.description} onChange={(e) => setNewEvent((p) => ({ ...p, description: e.target.value }))} className="input-field w-full h-24 resize-none" placeholder="Thème, règles, objectifs..." />
-            </div>
-
-            <div className="grid sm:grid-cols-2 lg:grid-cols-4 gap-4">
-              <div>
-                <label className="block text-sm font-medium text-body mb-1">Date de début *</label>
-                <input type="datetime-local" value={newEvent.startDate} onChange={(e) => setNewEvent((p) => ({ ...p, startDate: e.target.value }))} className="input-field w-full" required />
-              </div>
-              <div>
-                <label className="block text-sm font-medium text-body mb-1">Date de fin *</label>
-                <input type="datetime-local" value={newEvent.endDate} onChange={(e) => setNewEvent((p) => ({ ...p, endDate: e.target.value }))} className="input-field w-full" required />
-              </div>
-              <div>
-                <label className="block text-sm font-medium text-body mb-1">Durée de travail</label>
-                <input type="text" value={newEvent.workDuration} onChange={(e) => setNewEvent((p) => ({ ...p, workDuration: e.target.value }))} className="input-field w-full" placeholder="Ex: 48h" />
-              </div>
-              <div>
-                <label className="block text-sm font-medium text-body mb-1">Taille max équipe</label>
-                <input type="number" min="1" max="10" value={newEvent.maxTeamSize} onChange={(e) => setNewEvent((p) => ({ ...p, maxTeamSize: e.target.value }))} className="input-field w-full" />
-              </div>
-            </div>
-
-            <div>
-              <label className="block text-sm font-medium text-body mb-2">Prix (points, swag ou prix spécial)</label>
-              <div className="space-y-2">
-                {newEvent.prizes.map((prize, i) => (
-                  <div key={i} className="grid sm:grid-cols-4 gap-2 items-center">
-                    <div className="flex items-center gap-2">
-                      <span className="text-lg">{i === 0 ? '🥇' : i === 1 ? '🥈' : i === 2 ? '🥉' : `#${prize.place}`}</span>
-                      <span className="text-sm text-body">Place {prize.place}</span>
-                    </div>
-                    <select
-                      value={prize.rewardType || 'points'}
-                      onChange={(e) => {
-                        const u = [...newEvent.prizes];
-                        u[i] = { ...u[i], rewardType: e.target.value };
-                        setNewEvent((p) => ({ ...p, prizes: u }));
-                      }}
-                      className="input-field w-full"
-                    >
-                      <option value="points">Points</option>
-                      <option value="swag">Swag</option>
-                      <option value="prize">Prix</option>
-                    </select>
-                    {(prize.rewardType || 'points') === 'points' ? (
-                      <input
-                        type="number"
-                        min="0"
-                        value={prize.points}
-                        onChange={(e) => {
-                          const u = [...newEvent.prizes];
-                          u[i] = { ...u[i], points: e.target.value };
-                          setNewEvent((p) => ({ ...p, prizes: u }));
-                        }}
-                        className="input-field w-full"
-                        placeholder="Ex: 25"
-                      />
-                    ) : (
-                      <input
-                        type="text"
-                        value={prize.label || ''}
-                        onChange={(e) => {
-                          const u = [...newEvent.prizes];
-                          u[i] = { ...u[i], label: e.target.value };
-                          setNewEvent((p) => ({ ...p, prizes: u }));
-                        }}
-                        className="input-field w-full"
-                        placeholder={(prize.rewardType || 'points') === 'swag' ? 'Ex: T-shirt + stickers' : 'Ex: Bon d\'achat 100$'}
-                      />
-                    )}
-                    <span className="text-xs text-muted">
-                      {(prize.rewardType || 'points') === 'points' ? 'pts' : 'récompense'}
-                    </span>
-                  </div>
-                ))}
-                <button type="button" onClick={() => setNewEvent((p) => ({ ...p, prizes: [...p.prizes, { place: p.prizes.length + 1, rewardType: 'points', points: '', label: '' }] }))} className="text-sm text-primary-400 hover:text-primary-300">+ Ajouter un prix</button>
-              </div>
-            </div>
-
-            <div className="flex gap-3 pt-2">
-              <button type="submit" className="btn-primary flex items-center gap-2"><Rocket className="w-4 h-4" />Créer l'événement</button>
-              <button type="button" onClick={() => setShowCreateEvent(false)} className="btn-secondary">Annuler</button>
-            </div>
-          </form>
+          <AdminBuildathonEventForm
+            mode="create"
+            value={newEvent}
+            onChange={setNewEvent}
+            onSubmit={handleCreateEvent}
+            onCancel={() => setShowCreateEvent(false)}
+            eventTypes={EVENT_TYPES}
+          />
         </div>
       )}
 
@@ -851,115 +1618,88 @@ export default function Buildathon() {
             </button>
           </div>
 
-          <form onSubmit={handleUpdateEvent} className="space-y-4">
-            <div>
-              <label className="block text-sm font-medium text-body mb-2">Type d'événement *</label>
-              <div className="flex gap-3">
-                {EVENT_TYPES.map((t) => (
-                  <button
-                    key={t.value}
-                    type="button"
-                    onClick={() => setEditEvent((p) => ({ ...p, type: t.value }))}
-                    className={`flex items-center gap-2 px-4 py-3 rounded-xl border-2 transition-all ${editEvent.type === t.value ? 'border-amber-500 bg-amber-500/10 text-heading' : 'border-themed text-body hover:border-amber-500/50'}`}
-                  >
-                    <span className="text-xl">{t.icon}</span>
-                    <span className="font-medium">{t.label}</span>
-                  </button>
-                ))}
+          <AdminBuildathonEventForm
+            mode="edit"
+            value={editEvent}
+            onChange={setEditEvent}
+            onSubmit={handleUpdateEvent}
+            onCancel={() => { setShowEditEvent(false); setEditingEventId(null); }}
+            eventTypes={EVENT_TYPES}
+          />
+        </div>
+      )}
+
+      {/* Dedicated Submit Section */}
+      {showSubmitProject && selectedSubmitEvent && (
+        <div className="glass-card p-8 mb-6 border-2 border-accent-500/30">
+          <div className="flex items-center justify-between mb-6">
+            <h2 className="text-xl font-bold text-heading flex items-center gap-2">
+              <Send className="w-5 h-5 text-accent-400" />
+              Soumettre un projet - {selectedSubmitEvent.title}
+            </h2>
+            <button onClick={() => setShowSubmitProject(null)} className="text-muted hover:text-heading"><X className="w-5 h-5" /></button>
+          </div>
+          <div className="space-y-3">
+            <div className="grid sm:grid-cols-2 gap-3">
+              <div>
+                <label className="block text-sm font-medium text-body mb-1">Titre *</label>
+                <input type="text" value={newProject.title} onChange={(e) => setNewProject((p) => ({ ...p, title: e.target.value }))} className="input-field w-full" placeholder="Nom du projet" />
+              </div>
+              <div>
+                <label className="block text-sm font-medium text-body mb-1">Nom d'équipe *</label>
+                <input type="text" value={newProject.teamName} onChange={(e) => setNewProject((p) => ({ ...p, teamName: e.target.value }))} className="input-field w-full" placeholder="Votre équipe" />
               </div>
             </div>
-
-            <div>
-              <label className="block text-sm font-medium text-body mb-1">Titre *</label>
-              <input type="text" value={editEvent.title} onChange={(e) => setEditEvent((p) => ({ ...p, title: e.target.value }))} className="input-field w-full" required />
-            </div>
-
             <div>
               <label className="block text-sm font-medium text-body mb-1">Description</label>
-              <textarea value={editEvent.description} onChange={(e) => setEditEvent((p) => ({ ...p, description: e.target.value }))} className="input-field w-full h-24 resize-none" />
+              <textarea value={newProject.description} onChange={(e) => setNewProject((p) => ({ ...p, description: e.target.value }))} className="input-field w-full h-24 resize-none" placeholder="Technologies, problème résolu..." />
             </div>
-
-            <div className="grid sm:grid-cols-2 lg:grid-cols-4 gap-4">
+            <div className="grid sm:grid-cols-3 gap-3">
               <div>
-                <label className="block text-sm font-medium text-body mb-1">Date de début *</label>
-                <input type="datetime-local" value={editEvent.startDate} onChange={(e) => setEditEvent((p) => ({ ...p, startDate: e.target.value }))} className="input-field w-full" required />
+                <label className="block text-sm font-medium text-body mb-1">Catégorie</label>
+                <select value={newProject.category} onChange={(e) => setNewProject((p) => ({ ...p, category: e.target.value }))} className="input-field w-full">
+                  {PROJECT_CATEGORIES.map((c) => <option key={c.value} value={c.value}>{c.label}</option>)}
+                </select>
               </div>
               <div>
-                <label className="block text-sm font-medium text-body mb-1">Date de fin *</label>
-                <input type="datetime-local" value={editEvent.endDate} onChange={(e) => setEditEvent((p) => ({ ...p, endDate: e.target.value }))} className="input-field w-full" required />
+                <label className="block text-sm font-medium text-body mb-1"><Link2 className="w-3 h-3 inline mr-1" />Lien GitHub *</label>
+                <input type="url" value={newProject.repoUrl} onChange={(e) => setNewProject((p) => ({ ...p, repoUrl: e.target.value }))} className="input-field w-full" placeholder="https://github.com/..." required />
               </div>
               <div>
-                <label className="block text-sm font-medium text-body mb-1">Durée de travail</label>
-                <input type="text" value={editEvent.workDuration} onChange={(e) => setEditEvent((p) => ({ ...p, workDuration: e.target.value }))} className="input-field w-full" placeholder="Ex: 48h" />
-              </div>
-              <div>
-                <label className="block text-sm font-medium text-body mb-1">Taille max équipe</label>
-                <input type="number" min="1" max="10" value={editEvent.maxTeamSize} onChange={(e) => setEditEvent((p) => ({ ...p, maxTeamSize: e.target.value }))} className="input-field w-full" />
+                <label className="block text-sm font-medium text-body mb-1"><Video className="w-3 h-3 inline mr-1" />Vidéo démo *</label>
+                <input type="url" value={newProject.demoUrl} onChange={(e) => setNewProject((p) => ({ ...p, demoUrl: e.target.value }))} className="input-field w-full" placeholder="https://youtube.com/..." required />
               </div>
             </div>
-
-            <div>
-              <label className="block text-sm font-medium text-body mb-2">Prix (points, swag ou prix spécial)</label>
-              <div className="space-y-2">
-                {editEvent.prizes.map((prize, i) => (
-                  <div key={i} className="grid sm:grid-cols-4 gap-2 items-center">
-                    <div className="flex items-center gap-2">
-                      <span className="text-lg">{i === 0 ? '🥇' : i === 1 ? '🥈' : i === 2 ? '🥉' : `#${prize.place}`}</span>
-                      <span className="text-sm text-body">Place {prize.place}</span>
-                    </div>
-                    <select
-                      value={prize.rewardType || 'points'}
-                      onChange={(e) => {
-                        const u = [...editEvent.prizes];
-                        u[i] = { ...u[i], rewardType: e.target.value };
-                        setEditEvent((p) => ({ ...p, prizes: u }));
-                      }}
-                      className="input-field w-full"
-                    >
-                      <option value="points">Points</option>
-                      <option value="swag">Swag</option>
-                      <option value="prize">Prix</option>
-                    </select>
-                    {(prize.rewardType || 'points') === 'points' ? (
-                      <input
-                        type="number"
-                        min="0"
-                        value={prize.points}
-                        onChange={(e) => {
-                          const u = [...editEvent.prizes];
-                          u[i] = { ...u[i], points: e.target.value };
-                          setEditEvent((p) => ({ ...p, prizes: u }));
-                        }}
-                        className="input-field w-full"
-                        placeholder="Ex: 25"
-                      />
-                    ) : (
-                      <input
-                        type="text"
-                        value={prize.label || ''}
-                        onChange={(e) => {
-                          const u = [...editEvent.prizes];
-                          u[i] = { ...u[i], label: e.target.value };
-                          setEditEvent((p) => ({ ...p, prizes: u }));
-                        }}
-                        className="input-field w-full"
-                        placeholder={(prize.rewardType || 'points') === 'swag' ? 'Ex: T-shirt + stickers' : 'Ex: Bon d\'achat 100$'}
-                      />
-                    )}
-                    <span className="text-xs text-muted">
-                      {(prize.rewardType || 'points') === 'points' ? 'pts' : 'récompense'}
-                    </span>
-                  </div>
-                ))}
-                <button type="button" onClick={() => setEditEvent((p) => ({ ...p, prizes: [...p.prizes, { place: p.prizes.length + 1, rewardType: 'points', points: '', label: '' }] }))} className="text-sm text-amber-400 hover:text-amber-300">+ Ajouter un prix</button>
-              </div>
-            </div>
-
             <div className="flex gap-3 pt-2">
-              <button type="submit" className="btn-primary flex items-center gap-2"><Pencil className="w-4 h-4" />Enregistrer</button>
-              <button type="button" onClick={() => { setShowEditEvent(false); setEditingEventId(null); }} className="btn-secondary">Annuler</button>
+              <button onClick={() => handleSubmitProject(selectedSubmitEvent.id)} className="btn-primary flex items-center gap-2"><Send className="w-4 h-4" />Soumettre</button>
+              <button onClick={() => setShowSubmitProject(null)} className="btn-secondary">Annuler</button>
             </div>
-          </form>
+          </div>
+        </div>
+      )}
+
+      {/* Dedicated Admin Add Project Section */}
+      {isAdmin && showAdminProjectForm && selectedAdminEvent && (
+        <div className="glass-card p-8 mb-6 border-2 border-primary-500/30">
+          <div className="flex items-center justify-between mb-6">
+            <h2 className="text-xl font-bold text-heading flex items-center gap-2"><Plus className="w-5 h-5 text-primary-400" />Ajouter un projet (admin) - {selectedAdminEvent.title}</h2>
+            <button onClick={() => setShowAdminProjectForm(null)} className="text-muted hover:text-heading"><X className="w-5 h-5" /></button>
+          </div>
+          <div className="grid sm:grid-cols-2 gap-3 mb-3">
+            <input type="text" value={adminProject.userIdentifier} onChange={(e) => setAdminProject((p) => ({ ...p, userIdentifier: e.target.value }))} className="input-field" placeholder="Email ou ID (UZA-0SOM3ZSZ)" />
+            <input type="text" value={adminProject.teamName} onChange={(e) => setAdminProject((p) => ({ ...p, teamName: e.target.value }))} className="input-field" placeholder="Nom d'équipe" />
+            <input type="text" value={adminProject.title} onChange={(e) => setAdminProject((p) => ({ ...p, title: e.target.value }))} className="input-field" placeholder="Titre du projet" />
+            <select value={adminProject.category} onChange={(e) => setAdminProject((p) => ({ ...p, category: e.target.value }))} className="input-field">
+              {PROJECT_CATEGORIES.map((c) => <option key={c.value} value={c.value}>{c.label}</option>)}
+            </select>
+            <input type="url" value={adminProject.repoUrl} onChange={(e) => setAdminProject((p) => ({ ...p, repoUrl: e.target.value }))} className="input-field" placeholder="Lien GitHub" />
+            <input type="url" value={adminProject.demoUrl} onChange={(e) => setAdminProject((p) => ({ ...p, demoUrl: e.target.value }))} className="input-field" placeholder="Lien démo" />
+          </div>
+          <textarea value={adminProject.description} onChange={(e) => setAdminProject((p) => ({ ...p, description: e.target.value }))} className="input-field w-full h-24 resize-none mb-3" placeholder="Description du projet" />
+          <div className="flex gap-3 pt-2">
+            <button onClick={() => handleAdminAddProject(selectedAdminEvent.id)} className="btn-primary text-sm">Ajouter ce projet</button>
+            <button onClick={() => setShowAdminProjectForm(null)} className="btn-secondary text-sm">Annuler</button>
+          </div>
         </div>
       )}
 
@@ -981,23 +1721,36 @@ export default function Buildathon() {
           {filteredEvents.map((event) => {
             const status = getEventStatus(event);
             const statusInfo = STATUS_CONFIG[status];
-            const eventProjects = projects.filter((p) => p.buildathonId === event.id).sort((a, b) => (b.voteCount || 0) - (a.voteCount || 0));
+            const allEventProjects = sortProjectsForEventRanking(event, projects.filter((p) => p.buildathonId === event.id));
+            const eventProjects = isAdmin
+              ? allEventProjects
+              : allEventProjects.filter((p) => isProjectVisibleForParticipant(p, event, user?.uid));
+            const metrics = getEventPopularityMetrics(event.id, event.participants);
+            const adminSupervisionMetrics = getBuildathonSupervisionMetrics(event, allEventProjects);
+            const adminRankingProjects = sortProjectsForEventRanking(event, allEventProjects);
+            const integrityWarningsByProject = allEventProjects
+              .map((project) => ({
+                projectId: project.id,
+                title: project.title || 'Sans titre',
+                warnings: getProjectIntegrityWarnings(project),
+              }))
+              .filter((entry) => entry.warnings.length > 0);
             const isExpanded = expandedEvent === event.id;
             const isRegistered = event.participants?.includes(user?.uid);
-            const userHasSubmitted = eventProjects.some((p) => p.submittedBy === user?.uid);
+            const userHasSubmitted = allEventProjects.some((p) => p.submittedBy === user?.uid);
             const canSubmit = status === 'active' && isRegistered;
             const canVote = status === 'active' || status === 'ended';
             const canRegister = (status === 'upcoming' || status === 'active') && !isRegistered;
             const typeLabel = event.type === 'hackathon' ? 'Hackathon' : 'Buildathon';
             const typeIcon = event.type === 'hackathon' ? '💻' : '🏗️';
-            const userVotedProject = eventProjects.find((p) => p.votes?.includes(user?.uid));
+            const userVotedProject = allEventProjects.find((p) => p.votes?.includes(user?.uid));
 
             return (
               <div key={event.id} className="glass-card overflow-hidden">
                 {/* Event Header */}
-                <div className="p-6 cursor-pointer hover:bg-black/5 dark:hover:bg-white/5 transition-colors" onClick={() => setExpandedEvent(isExpanded ? null : event.id)}>
+                <div className="p-6">
                   <div className="flex items-start justify-between gap-4">
-                    <div className="flex-1">
+                    <div className="flex-1 min-w-0">
                       <div className="flex items-center gap-3 mb-2 flex-wrap">
                         <span className="text-2xl">{typeIcon}</span>
                         <h2 className="text-xl font-bold text-heading">{event.title}</h2>
@@ -1007,18 +1760,29 @@ export default function Buildathon() {
                         </span>
                         <span className="badge bg-surface text-body border border-themed text-xs">{typeLabel}</span>
                       </div>
-                      {event.description && <p className="text-body text-sm mb-3 whitespace-pre-wrap">{event.description}</p>}
-                      <div className="flex flex-wrap items-center gap-4 text-xs text-muted">
-                        <span className="flex items-center gap-1"><Calendar className="w-3.5 h-3.5" />{formatEventDate(event.startDate)} → {formatEventDate(event.endDate)}</span>
-                        {event.workDuration && <span className="flex items-center gap-1"><Clock className="w-3.5 h-3.5" />{event.workDuration}</span>}
-                        <span className="flex items-center gap-1"><Users className="w-3.5 h-3.5" />{event.participants?.length || 0} inscrit{(event.participants?.length || 0) !== 1 ? 's' : ''}</span>
-                        <span className="flex items-center gap-1"><FileText className="w-3.5 h-3.5" />{eventProjects.length} projet{eventProjects.length !== 1 ? 's' : ''}</span>
-                        {(status === 'active' || status === 'upcoming') && event.endDate && <span className="text-amber-400"><CountdownTimer endDate={event.endDate} /></span>}
+                      <p className="text-body text-sm mb-4 line-clamp-2">{event.description || 'Aucune description disponible.'}</p>
+                      <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4 text-xs">
+                        <div className="rounded-lg border border-themed bg-black/5 dark:bg-white/5 px-3 py-2">
+                          <p className="text-muted mb-1">Début</p>
+                          <p className="text-heading font-medium">{formatEventDate(event.startDate)}</p>
+                        </div>
+                        <div className="rounded-lg border border-themed bg-black/5 dark:bg-white/5 px-3 py-2">
+                          <p className="text-muted mb-1">Fin</p>
+                          <p className="text-heading font-medium">{formatEventDate(getEffectiveEventEndDate(event))}</p>
+                        </div>
+                        <div className="rounded-lg border border-themed bg-black/5 dark:bg-white/5 px-3 py-2">
+                          <p className="text-muted mb-1">Participants</p>
+                          <p className="text-heading font-medium">{metrics.participantsCount}</p>
+                        </div>
+                        <div className="rounded-lg border border-themed bg-black/5 dark:bg-white/5 px-3 py-2">
+                          <p className="text-muted mb-1">Projets</p>
+                          <p className="text-heading font-medium">{metrics.submittedProjects}</p>
+                        </div>
                       </div>
                     </div>
-                    <div className="flex items-center gap-3">
-                      {event.prizes?.length > 0 && (
-                        <div className="hidden sm:flex items-center gap-1.5">
+                    <div className="flex items-center gap-2 shrink-0">
+                      {event.rewardsVisible !== false && event.prizes?.length > 0 && (
+                        <div className="hidden sm:flex items-center gap-1.5 flex-wrap max-w-[240px] justify-end">
                           {event.prizes.slice(0, 3).map((p, i) => (
                             <span key={i} className="flex items-center gap-0.5 badge bg-amber-500/10 text-amber-400 border-amber-500/30 text-xs">
                               {(p.rewardType || 'points') === 'points' ? <Zap className="w-3 h-3" /> : <Gift className="w-3 h-3" />}
@@ -1027,304 +1791,63 @@ export default function Buildathon() {
                           ))}
                         </div>
                       )}
-                      {isExpanded ? <ChevronUp className="w-5 h-5 text-muted" /> : <ChevronDown className="w-5 h-5 text-muted" />}
                     </div>
+                  </div>
+
+                  <div className="mt-4 flex flex-wrap items-center gap-2">
+                    <Link
+                      to={`/projects/${event.id}`}
+                      className="btn-primary text-sm inline-flex items-center gap-1"
+                    >
+                      Voir le buildathon
+                    </Link>
+                    {isAdmin && (
+                      <button
+                        type="button"
+                        onClick={(e) => { e.stopPropagation(); handleOpenEditEvent(event); }}
+                        className="btn-secondary text-sm inline-flex items-center gap-1"
+                      >
+                        <Pencil className="w-3.5 h-3.5" />
+                        Modifier l'événement
+                      </button>
+                    )}
+                    {isAdmin && !event.finalized && status === 'ended' && (
+                      <button
+                        type="button"
+                        onClick={(e) => { e.stopPropagation(); handleFinalize(event.id); }}
+                        className="btn-secondary text-sm inline-flex items-center gap-1"
+                      >
+                        <Trophy className="w-3.5 h-3.5" />
+                        Confirmer attribution points
+                      </button>
+                    )}
+                    {isAdmin && event.finalized && (
+                      <button
+                        type="button"
+                        onClick={(e) => { e.stopPropagation(); handleRevokeFinalization(event.id); }}
+                        className="btn-secondary text-sm inline-flex items-center gap-1"
+                      >
+                        <Trash2 className="w-3.5 h-3.5" />
+                        Annuler les points attribués
+                      </button>
+                    )}
+                    {canRegister && (
+                      <button
+                        onClick={(e) => { e.stopPropagation(); handleRegister(event.id); }}
+                        className="btn-secondary text-sm inline-flex items-center gap-1"
+                      >
+                        <UserPlus className="w-3.5 h-3.5" />
+                        S'inscrire
+                      </button>
+                    )}
+                    {isRegistered && (
+                      <span className="text-xs text-green-400 flex items-center gap-1">
+                        <CheckCircle className="w-3.5 h-3.5" />
+                        Inscrit
+                      </span>
+                    )}
                   </div>
                 </div>
-
-                {/* Expanded */}
-                {isExpanded && (
-                  <div className="border-t border-themed">
-                    {/* Actions */}
-                    <div className="px-6 py-3 bg-black/5 dark:bg-white/5 flex items-center justify-between flex-wrap gap-2">
-                      <div className="flex items-center gap-3 flex-wrap">
-                        {canRegister && (
-                          <button onClick={(e) => { e.stopPropagation(); handleRegister(event.id); }} className="btn-primary text-sm flex items-center gap-1"><UserPlus className="w-3.5 h-3.5" />S'inscrire</button>
-                        )}
-                        {isRegistered && <span className="text-xs text-green-400 flex items-center gap-1"><CheckCircle className="w-3.5 h-3.5" />Inscrit</span>}
-                        {canSubmit && !userHasSubmitted && (
-                          <button onClick={(e) => { e.stopPropagation(); setShowSubmitProject(event.id); }} className="btn-accent text-sm flex items-center gap-1"><Send className="w-3.5 h-3.5" />Soumettre un projet</button>
-                        )}
-                        {userHasSubmitted && <span className="text-xs text-accent-400 flex items-center gap-1"><CheckCircle className="w-3.5 h-3.5" />Projet soumis</span>}
-                        {isAdmin && (
-                          <>
-                            <button
-                              onClick={(e) => { e.stopPropagation(); setShowAdminProjectForm(showAdminProjectForm === event.id ? null : event.id); }}
-                              className="flex items-center gap-1 text-sm px-3 py-1.5 rounded-lg bg-primary-500/10 text-primary-300 border border-primary-500/30 hover:bg-primary-500/20 transition-colors"
-                            >
-                              <Plus className="w-3.5 h-3.5" />Ajouter projet
-                            </button>
-                            <button
-                              onClick={(e) => { e.stopPropagation(); handleOpenEditEvent(event); }}
-                              className="flex items-center gap-1 text-sm px-3 py-1.5 rounded-lg bg-blue-500/10 text-blue-400 border border-blue-500/30 hover:bg-blue-500/20 transition-colors"
-                            >
-                              <Pencil className="w-3.5 h-3.5" />Modifier
-                            </button>
-                            <button
-                              onClick={(e) => { e.stopPropagation(); handleDeleteEvent(event.id); }}
-                              className="flex items-center gap-1 text-sm px-3 py-1.5 rounded-lg bg-red-500/10 text-red-400 border border-red-500/30 hover:bg-red-500/20 transition-colors"
-                            >
-                              <Trash2 className="w-3.5 h-3.5" />Supprimer
-                            </button>
-                          </>
-                        )}
-                      </div>
-                      {isAdmin && !event.finalized && (status === 'ended' || status === 'active') && (
-                        <button onClick={(e) => { e.stopPropagation(); if (confirm('Finaliser et attribuer les points ?')) handleFinalize(event.id); }} className="flex items-center gap-1 text-sm px-3 py-1.5 rounded-lg bg-amber-500/10 text-amber-400 border border-amber-500/30 hover:bg-amber-500/20 transition-colors">
-                          <Award className="w-3.5 h-3.5" />Finaliser & Attribuer prix
-                        </button>
-                      )}
-                      {event.finalized && <span className="text-xs text-green-400 flex items-center gap-1"><CheckCircle className="w-3.5 h-3.5" />Finalisé</span>}
-                    </div>
-
-                    {event.description && (
-                      <div className="px-6 py-4 border-t border-themed bg-black/5 dark:bg-white/5">
-                        <p className="text-xs uppercase tracking-wide text-muted mb-1">Description complète</p>
-                        <p className="text-sm text-body whitespace-pre-wrap">{event.description}</p>
-                      </div>
-                    )}
-
-                    {isAdmin && showAdminProjectForm === event.id && (
-                      <div className="p-6 border-t border-themed bg-primary-500/5">
-                        <div className="flex items-center justify-between mb-3">
-                          <h3 className="text-lg font-semibold text-heading">Ajouter un projet (admin)</h3>
-                          <button onClick={() => setShowAdminProjectForm(null)} className="btn-secondary text-xs">Fermer</button>
-                        </div>
-                        <div className="grid sm:grid-cols-2 gap-3 mb-3">
-                          <input
-                            type="text"
-                            value={adminProject.userIdentifier}
-                            onChange={(e) => setAdminProject((p) => ({ ...p, userIdentifier: e.target.value }))}
-                            className="input-field"
-                            placeholder="Email ou ID (UZA-0SOM3ZSZ)"
-                          />
-                          <input type="text" value={adminProject.teamName} onChange={(e) => setAdminProject((p) => ({ ...p, teamName: e.target.value }))} className="input-field" placeholder="Nom d'équipe" />
-                          <input type="text" value={adminProject.title} onChange={(e) => setAdminProject((p) => ({ ...p, title: e.target.value }))} className="input-field" placeholder="Titre du projet" />
-                          <select value={adminProject.category} onChange={(e) => setAdminProject((p) => ({ ...p, category: e.target.value }))} className="input-field">
-                            {PROJECT_CATEGORIES.map((c) => <option key={c.value} value={c.value}>{c.label}</option>)}
-                          </select>
-                          <input type="url" value={adminProject.repoUrl} onChange={(e) => setAdminProject((p) => ({ ...p, repoUrl: e.target.value }))} className="input-field" placeholder="Lien GitHub" />
-                          <input type="url" value={adminProject.demoUrl} onChange={(e) => setAdminProject((p) => ({ ...p, demoUrl: e.target.value }))} className="input-field" placeholder="Lien démo" />
-                        </div>
-                        <textarea value={adminProject.description} onChange={(e) => setAdminProject((p) => ({ ...p, description: e.target.value }))} className="input-field w-full h-24 resize-none mb-3" placeholder="Description du projet" />
-                        <div className="flex flex-wrap gap-2">
-                          <button onClick={() => handleAdminAddProject(event.id)} className="btn-primary text-sm">Ajouter ce projet</button>
-                          <button
-                            onClick={() => setAdminProject({
-                              userIdentifier: 'UZA-0SOM3ZSZ',
-                              title: 'Lady Fashion',
-                              description: 'Ce projet est une application web de commerce électronique conçue pour offrir une expérience de shopping fluide et visuelle. L\'objectif était de créer une interface utilisateur minimaliste et élégante, mettant en avant les collections de vêtements pour femmes.',
-                              category: 'web',
-                              teamName: 'Lady Fashion',
-                              repoUrl: 'https://github.com/johannabinja/lady-fashion',
-                              demoUrl: 'https://johannabinja.github.io/lady-fashion/',
-                            })}
-                            className="btn-secondary text-sm"
-                          >
-                            Préremplir Lady Fashion
-                          </button>
-                        </div>
-                      </div>
-                    )}
-
-                    {/* Submit Project Form */}
-                    {showSubmitProject === event.id && (
-                      <div className="p-6 border-t border-themed bg-primary-500/5">
-                        <h3 className="text-lg font-semibold text-heading mb-4 flex items-center gap-2"><Send className="w-5 h-5 text-primary-400" />Soumettre votre projet</h3>
-                        <div className="space-y-3">
-                          <div className="grid sm:grid-cols-2 gap-3">
-                            <div>
-                              <label className="block text-sm font-medium text-body mb-1">Titre *</label>
-                              <input type="text" value={newProject.title} onChange={(e) => setNewProject((p) => ({ ...p, title: e.target.value }))} className="input-field w-full" placeholder="Nom du projet" />
-                            </div>
-                            <div>
-                              <label className="block text-sm font-medium text-body mb-1">Nom d'équipe *</label>
-                              <input type="text" value={newProject.teamName} onChange={(e) => setNewProject((p) => ({ ...p, teamName: e.target.value }))} className="input-field w-full" placeholder="Votre équipe" />
-                            </div>
-                          </div>
-                          <div>
-                            <label className="block text-sm font-medium text-body mb-1">Description</label>
-                            <textarea value={newProject.description} onChange={(e) => setNewProject((p) => ({ ...p, description: e.target.value }))} className="input-field w-full h-20 resize-none" placeholder="Technologies, problème résolu..." />
-                          </div>
-                          <div className="grid sm:grid-cols-3 gap-3">
-                            <div>
-                              <label className="block text-sm font-medium text-body mb-1">Catégorie</label>
-                              <select value={newProject.category} onChange={(e) => setNewProject((p) => ({ ...p, category: e.target.value }))} className="input-field w-full">
-                                {PROJECT_CATEGORIES.map((c) => <option key={c.value} value={c.value}>{c.label}</option>)}
-                              </select>
-                            </div>
-                            <div>
-                              <label className="block text-sm font-medium text-body mb-1"><Link2 className="w-3 h-3 inline mr-1" />Lien GitHub *</label>
-                              <input type="url" value={newProject.repoUrl} onChange={(e) => setNewProject((p) => ({ ...p, repoUrl: e.target.value }))} className="input-field w-full" placeholder="https://github.com/..." required />
-                            </div>
-                            <div>
-                              <label className="block text-sm font-medium text-body mb-1"><Video className="w-3 h-3 inline mr-1" />Vidéo démo *</label>
-                              <input type="url" value={newProject.demoUrl} onChange={(e) => setNewProject((p) => ({ ...p, demoUrl: e.target.value }))} className="input-field w-full" placeholder="https://youtube.com/..." required />
-                            </div>
-                          </div>
-                          <div className="flex gap-3 pt-2">
-                            <button onClick={() => handleSubmitProject(event.id)} className="btn-primary flex items-center gap-2"><Send className="w-4 h-4" />Soumettre</button>
-                            <button onClick={() => setShowSubmitProject(null)} className="btn-secondary">Annuler</button>
-                          </div>
-                        </div>
-                      </div>
-                    )}
-
-                    {/* Projects */}
-                    <div className="p-6">
-                      {eventProjects.length === 0 ? (
-                        <div className="text-center py-8">
-                          <FileText className="w-12 h-12 text-muted mx-auto mb-3 opacity-30" />
-                          <p className="text-body">Aucun projet soumis pour le moment</p>
-                          {canSubmit && <p className="text-sm text-muted mt-1">Soyez le premier à soumettre !</p>}
-                        </div>
-                      ) : (
-                        <div className="space-y-3">
-                          <h3 className="text-sm font-semibold text-heading uppercase tracking-wider mb-3 flex items-center gap-2">
-                            <Trophy className="w-4 h-4 text-amber-400" />
-                            Classement des projets ({eventProjects.length})
-                          </h3>
-                          {eventProjects.map((project, index) => {
-                            const hasVoted = project.votes?.includes(user?.uid);
-                            const isOwn = project.submittedBy === user?.uid;
-                            const categoryInfo = PROJECT_CATEGORIES.find((c) => c.value === project.category);
-                            const isWinner = event.finalized && index < (event.prizes?.length || 3);
-                            const canUserVote = canVote && !isOwn && (!userVotedProject || hasVoted);
-                            const votePoints = (project.voteCount || 0) * 10;
-
-                            return (
-                              <div key={project.id} className={`p-4 rounded-xl border transition-all ${isWinner ? index === 0 ? 'border-amber-400/50 bg-gradient-to-r from-amber-500/10 to-transparent shadow-lg shadow-amber-500/5' : index === 1 ? 'border-gray-400/40 bg-gradient-to-r from-gray-400/10 to-transparent' : 'border-orange-500/40 bg-gradient-to-r from-orange-500/10 to-transparent' : 'border-themed bg-black/5 dark:bg-white/5'}`}>
-                                <div className="flex items-start justify-between gap-3">
-                                  <div className="flex-1 min-w-0">
-                                    <div className="flex items-center gap-2 flex-wrap mb-1">
-                                      <span className={`text-sm font-bold ${index === 0 ? 'text-amber-400' : index === 1 ? 'text-gray-400' : index === 2 ? 'text-orange-400' : 'text-muted'}`}>#{index + 1}</span>
-                                      {isWinner && index === 0 && <Crown className="w-4 h-4 text-amber-400" />}
-                                      {isWinner && index > 0 && <Award className="w-4 h-4 text-amber-500" />}
-                                      <span className="font-semibold text-heading">{project.title}</span>
-                                      {categoryInfo && <span className={`badge text-xs border ${categoryInfo.color}`}>{categoryInfo.label}</span>}
-                                      {isOwn && <span className="badge-primary text-[10px]">Votre projet</span>}
-                                    </div>
-                                    {project.description && <p className="text-sm text-body mb-2 line-clamp-2">{project.description}</p>}
-                                    <div className="flex flex-wrap items-center gap-3 text-xs text-muted">
-                                      <span className="flex items-center gap-1"><Users className="w-3 h-3" />{project.teamName}</span>
-                                      <div className="flex items-center gap-1">
-                                        <div className="flex -space-x-1">
-                                          {project.members?.map((m, mi) => (
-                                            <span key={mi} className="w-5 h-5 rounded-full bg-green-500/20 text-green-400 flex items-center justify-center text-[10px] font-bold border border-surface" title={`${m.name} (confirmé)`}>{(m.name || '?')[0].toUpperCase()}</span>
-                                          ))}
-                                        </div>
-                                        {/* Show pending invitations for this project */}
-                                        {projectPendingInvites.filter((inv) => inv.projectId === project.id).map((inv, pi) => (
-                                          <span key={`pending-${pi}`} className="w-5 h-5 rounded-full bg-amber-500/20 text-amber-400 flex items-center justify-center text-[10px] font-bold border border-dashed border-amber-500/50" title={`${inv.invitedName} (en attente)`}>{(inv.invitedName || '?')[0].toUpperCase()}</span>
-                                        ))}
-                                        <span className="text-[10px] ml-1">({project.members?.length || 0} membre{(project.members?.length || 0) > 1 ? 's' : ''})</span>
-                                      </div>
-                                      <a href={project.repoUrl} target="_blank" rel="noopener noreferrer" className="flex items-center gap-1 text-primary-400 hover:underline" onClick={(e) => e.stopPropagation()}>
-                                        <Link2 className="w-3 h-3" />GitHub
-                                      </a>
-                                      <a href={project.demoUrl} target="_blank" rel="noopener noreferrer" className="flex items-center gap-1 text-primary-400 hover:underline" onClick={(e) => e.stopPropagation()}>
-                                        <Video className="w-3 h-3" />Démo
-                                      </a>
-                                      <span className="flex items-center gap-1 text-amber-400 font-medium"><Zap className="w-3 h-3" />{votePoints} pts</span>
-                                      {isWinner && event.prizes?.[index] && (
-                                        <span className="flex items-center gap-1 text-green-400 font-medium">
-                                          {(event.prizes[index].rewardType || 'points') === 'points'
-                                            ? <><Trophy className="w-3 h-3" />+{Math.round((event.prizes[index].points || 0) / (project.members?.length || 1))}/{project.members?.length || 1} mbr</>
-                                            : <><Gift className="w-3 h-3" />{event.prizes[index].label || 'Récompense'}</>
-                                          }
-                                        </span>
-                                      )}
-                                    </div>
-                                    {/* Invite friend */}
-                                    {isOwn && status === 'active' && (
-                                      <div className="mt-3 p-3 rounded-lg bg-black/5 dark:bg-white/5 border border-themed">
-                                        <div className="flex items-center gap-2 mb-2">
-                                          <input type="text" value={newProject.inviteIdentifier} onChange={(e) => setNewProject((p) => ({ ...p, inviteIdentifier: e.target.value }))} className="input-field text-xs py-1.5 px-3 flex-1" placeholder="Email ou ID (UZA-xxxx...)" onClick={(e) => e.stopPropagation()} />
-                                          <button onClick={(e) => { e.stopPropagation(); handleInviteFriend(project.id, event.id); }} className="text-xs px-3 py-1.5 rounded-lg bg-primary-500/10 text-primary-400 hover:bg-primary-500/20 border border-primary-500/30 flex items-center gap-1 transition-colors"><UserPlus className="w-3 h-3" />Inviter</button>
-                                        </div>
-                                        {/* Show pending invites */}
-                                        {projectPendingInvites.filter((inv) => inv.projectId === project.id).length > 0 && (
-                                          <div className="space-y-1">
-                                            {projectPendingInvites.filter((inv) => inv.projectId === project.id).map((inv) => (
-                                              <div key={inv.id} className="flex items-center justify-between text-xs py-1 px-2 rounded bg-amber-500/5 border border-amber-500/20">
-                                                <span className="flex items-center gap-1.5 text-amber-400">
-                                                  <Clock className="w-3 h-3" />
-                                                  {inv.invitedName} ({inv.invitedEmail}) — en attente
-                                                </span>
-                                              </div>
-                                            ))}
-                                          </div>
-                                        )}
-                                        <p className="text-[10px] text-muted mt-1">💡 Invitation possible par email ou ID UZA. L'utilisateur doit accepter l'invitation pour rejoindre l'équipe.</p>
-                                      </div>
-                                    )}
-                                    {/* Show team info for non-owner members */}
-                                    {!isOwn && project.members?.some((m) => m.uid === user?.uid) && (
-                                      <div className="mt-2">
-                                        <span className="text-xs text-green-400 flex items-center gap-1"><UserCheck className="w-3 h-3" />Vous êtes membre de cette équipe</span>
-                                      </div>
-                                    )}
-                                  </div>
-                                  {/* Vote */}
-                                  <div className="flex flex-col items-center gap-1 min-w-[48px]">
-                                    <button
-                                      onClick={(e) => {
-                                        e.stopPropagation();
-                                        if (isOwn) { toast.error('Impossible de voter pour votre projet'); return; }
-                                        if (!canVote) { toast.error('Vote fermé'); return; }
-                                        if (!canUserVote && !hasVoted) { toast.error('Vous avez déjà voté pour un autre projet'); return; }
-                                        handleVote(project.id, event.id, project.votes);
-                                      }}
-                                      disabled={isOwn || !canVote || (!canUserVote && !hasVoted)}
-                                      className={`p-2.5 rounded-xl transition-all ${hasVoted ? 'bg-primary-500/20 text-primary-400 ring-2 ring-primary-500/30' : isOwn || !canUserVote ? 'bg-black/5 dark:bg-white/5 text-muted cursor-not-allowed' : 'bg-black/5 dark:bg-white/5 text-body hover:bg-primary-500/10 hover:text-primary-400'}`}
-                                    >
-                                      <ThumbsUp className={`w-5 h-5 ${hasVoted ? 'fill-current' : ''}`} />
-                                    </button>
-                                    <span className={`text-sm font-bold ${hasVoted ? 'text-primary-400' : 'text-body'}`}>{project.voteCount || 0}</span>
-                                    <span className="text-[9px] text-muted">vote{(project.voteCount || 0) !== 1 ? 's' : ''}</span>
-                                  </div>
-                                </div>
-                              </div>
-                            );
-                          })}
-                        </div>
-                      )}
-
-                      {/* Prizes */}
-                      {event.prizes?.length > 0 && (
-                        <div className="mt-6 pt-4 border-t border-themed">
-                          <h4 className="text-sm font-semibold text-heading mb-3 flex items-center gap-2"><Award className="w-4 h-4 text-amber-400" />Prix</h4>
-                          <div className="flex flex-wrap gap-3">
-                            {event.prizes.map((prize, i) => {
-                              const winner = event.finalized && eventProjects[i];
-                              const memberCount = winner?.members?.length || 1;
-                              const rewardType = prize.rewardType || 'points';
-                              const totalPoints = Number(prize.points || 0);
-                              const ptsPerMember = rewardType === 'points' ? Math.round(totalPoints / memberCount) : 0;
-                              return (
-                                <div key={i} className={`p-3 rounded-xl border text-center min-w-[120px] ${i === 0 ? 'border-amber-500/30 bg-amber-500/5' : i === 1 ? 'border-gray-400/30 bg-gray-400/5' : 'border-orange-500/30 bg-orange-500/5'}`}>
-                                  <div className="text-2xl mb-1">{i === 0 ? '🥇' : i === 1 ? '🥈' : i === 2 ? '🥉' : `#${prize.place}`}</div>
-                                  {rewardType === 'points' ? (
-                                    <div className="flex items-center justify-center gap-1 text-amber-400 font-bold text-sm"><Zap className="w-3.5 h-3.5" />{totalPoints} pts</div>
-                                  ) : (
-                                    <div className="flex items-center justify-center gap-1 text-amber-400 font-bold text-sm"><Gift className="w-3.5 h-3.5" />{prize.label || 'Récompense'}</div>
-                                  )}
-                                  {winner && (
-                                    <>
-                                      <p className="text-xs text-heading mt-1 font-medium">{winner.teamName}</p>
-                                      {rewardType === 'points' && memberCount > 1 && <p className="text-[10px] text-muted mt-0.5">({ptsPerMember} pts/membre)</p>}
-                                    </>
-                                  )}
-                                </div>
-                              );
-                            })}
-                          </div>
-                          <p className="text-xs text-muted mt-3">💡 Chaque vote = 10 pts. 1 vote/personne/événement. Les prix sont répartis entre les membres de l'équipe.</p>
-                        </div>
-                      )}
-                    </div>
-                  </div>
-                )}
               </div>
             );
           })}
@@ -1333,3 +1856,5 @@ export default function Buildathon() {
     </div>
   );
 }
+
+
