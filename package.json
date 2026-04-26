@@ -6,12 +6,17 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build",
+    "start": "node server.js",
     "preview": "vite preview",
     "lint": "eslint . --ext .js,.jsx"
   },
   "dependencies": {
     "date-fns": "^2.30.0",
     "firebase": "^10.7.1",
+    "firebase-admin": "^11.11.1",
+    "express": "^4.18.2",
+    "cors": "^2.8.5",
+    "dotenv": "^16.3.1",
     "html2canvas": "^1.4.1",
     "jspdf": "^2.5.1",
     "lucide-react": "^0.294.0",

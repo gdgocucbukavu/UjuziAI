@@ -1,4 +1,4 @@
-﻿import { useState, useEffect, useMemo } from 'react';
+﻿import { useState, useEffect, useMemo, useRef } from 'react';
 import { Link } from 'react-router-dom';
 import {
   collection,
@@ -188,6 +188,7 @@ const DEFAULT_BUILDATHON_CONFIG = {
   tieBreakRuleText: 'En cas d\'égalité, le projet soumis le plus tôt est prioritaire.',
   rewardsVisible: true,
   projectVisibility: 'published-only',
+  mode: 'public',
   submissionOpen: true,
   publicationStatus: 'published',
   juryModeEnabled: false,
@@ -195,6 +196,13 @@ const DEFAULT_BUILDATHON_CONFIG = {
   rankingMode: 'public',
   judgeCriteria: [],
 };
+
+function normalizeBuildathonMode(raw) {
+  if (raw?.mode === 'jury') return 'jury';
+  if (raw?.juryModeEnabled === true) return 'jury';
+  if (raw?.rankingMode === 'jury') return 'jury';
+  return 'public';
+}
 
 const DEFAULT_BUILDATHON_PROJECT_META = {
   projectStatus: 'soumis',
@@ -217,7 +225,7 @@ const DEFAULT_BUILDATHON_PROJECT_META = {
 const PROJECT_STATUSES = ['brouillon', 'soumis', 'valide', 'rejete', 'publie'];
 
 function getCanonicalProjectStatus(project = {}) {
-  const raw = String(project.projectStatus || '').toLowerCase();
+  const raw = String(project.projectStatus || project.status || '').toLowerCase();
   const normalizedRaw = raw
     .replace('é', 'e')
     .replace('à', 'a')
@@ -263,6 +271,11 @@ function isProjectVisibleForParticipant(project, event, uid) {
   if (isOwner) return true;
 
   if (status === 'rejete') return false;
+
+  const isJuryMode = event?.mode === 'jury' || event?.rankingMode === 'jury' || event?.juryModeEnabled === true;
+  if (isJuryMode) {
+    return status !== 'brouillon';
+  }
 
   if ((event?.projectVisibility || 'published-only') === 'all-submitted') {
     return status !== 'brouillon';
@@ -421,6 +434,7 @@ export default function Buildathon() {
   });
   const [showEditEvent, setShowEditEvent] = useState(false);
   const [editingEventId, setEditingEventId] = useState(null);
+  const editFormRef = useRef(null);
   const [editEvent, setEditEvent] = useState({
     type: 'buildathon',
     title: '',
@@ -537,10 +551,13 @@ export default function Buildathon() {
         projectVisibility: newEvent.projectVisibility || 'published-only',
         submissionOpen: newEvent.submissionOpen !== false,
         publicationStatus: newEvent.publicationStatus || 'published',
-        juryModeEnabled: newEvent.juryModeEnabled === true,
+        mode: normalizeBuildathonMode(newEvent),
+        juryModeEnabled: normalizeBuildathonMode(newEvent) === 'jury',
         juryResultsPublished: newEvent.juryResultsPublished === true,
-        rankingMode: newEvent.juryModeEnabled ? 'jury' : 'public',
+        rankingMode: normalizeBuildathonMode(newEvent),
         judgeCriteria: Array.isArray(newEvent.judgeCriteria) ? newEvent.judgeCriteria : [],
+        submittedProjectsCount: 0,
+        publishedProjectsCount: 0,
         participants: [],
         createdBy: user.uid,
         createdAt: serverTimestamp(),
@@ -559,6 +576,9 @@ export default function Buildathon() {
 
   // ---- Admin: Edit Event ----
   function handleOpenEditEvent(event) {
+    setShowCreateEvent(false);
+    setShowSubmitProject(null);
+    setShowAdminProjectForm(null);
     setEditingEventId(event.id);
     setEditEvent({
       type: event.type || 'buildathon',
@@ -586,7 +606,8 @@ export default function Buildathon() {
       projectVisibility: event.projectVisibility || 'published-only',
       submissionOpen: event.submissionOpen !== false,
       publicationStatus: event.publicationStatus || 'published',
-      juryModeEnabled: event.juryModeEnabled === true,
+      mode: normalizeBuildathonMode(event),
+      juryModeEnabled: normalizeBuildathonMode(event) === 'jury',
       juryResultsPublished: event.juryResultsPublished === true,
       judgeCriteria: Array.isArray(event.judgeCriteria) ? event.judgeCriteria : [],
       prizes: (event.prizes && event.prizes.length > 0)
@@ -602,6 +623,13 @@ export default function Buildathon() {
     });
     setShowEditEvent(true);
   }
+
+  useEffect(() => {
+    if (!showEditEvent) return;
+    if (editFormRef.current) {
+      editFormRef.current.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    }
+  }, [showEditEvent, editingEventId]);
 
   async function handleUpdateEvent(e) {
     e.preventDefault();
@@ -641,9 +669,10 @@ export default function Buildathon() {
         projectVisibility: editEvent.projectVisibility || 'published-only',
         submissionOpen: editEvent.submissionOpen !== false,
         publicationStatus: editEvent.publicationStatus || 'published',
-        juryModeEnabled: editEvent.juryModeEnabled === true,
+        mode: normalizeBuildathonMode(editEvent),
+        juryModeEnabled: normalizeBuildathonMode(editEvent) === 'jury',
         juryResultsPublished: editEvent.juryResultsPublished === true,
-        rankingMode: editEvent.juryModeEnabled ? 'jury' : 'public',
+        rankingMode: normalizeBuildathonMode(editEvent),
         judgeCriteria: Array.isArray(editEvent.judgeCriteria) ? editEvent.judgeCriteria : [],
         updatedAt: serverTimestamp(),
         updatedBy: user.uid,
@@ -743,7 +772,11 @@ export default function Buildathon() {
         submittedAt: serverTimestamp(),
       });
 
-      await updateDoc(doc(db, 'buildathons', eventId), { participants: arrayUnion(targetUser.uid) });
+      await updateDoc(doc(db, 'buildathons', eventId), {
+        participants: arrayUnion(targetUser.uid),
+        submittedProjectsCount: increment(1),
+        publishedProjectsCount: increment(1),
+      });
       toast.success(`Projet ajouté pour ${targetUser.name}`);
       setShowAdminProjectForm(null);
       setAdminProject({ userIdentifier: '', title: '', description: '', category: 'web', teamName: '', repoUrl: '', demoUrl: '' });
@@ -1446,6 +1479,19 @@ export default function Buildathon() {
     return warnings;
   }
 
+  function getEventCoverImageUrl(event = {}) {
+    const value = String(event.coverImageUrl || '').trim();
+    if (!value) return '/icon-512.png';
+
+    try {
+      const parsedUrl = new URL(value);
+      if (parsedUrl.protocol !== 'https:') return '/icon-512.png';
+      return parsedUrl.toString();
+    } catch {
+      return '/icon-512.png';
+    }
+  }
+
   function getPopularityBucket(event) {
     const { popularityScore } = getEventPopularityMetrics(event.id, event.participants);
     if (popularityScore >= 20) return 'high';
@@ -1604,7 +1650,7 @@ export default function Buildathon() {
 
       {/* Admin: Edit Event Form */}
       {showEditEvent && isAdmin && (
-        <div className="glass-card p-8 mb-6 border-2 border-amber-500/30">
+        <div ref={editFormRef} className="glass-card p-8 mb-6 border-2 border-amber-500/30">
           <div className="flex items-center justify-between mb-6">
             <h2 className="text-xl font-bold text-heading flex items-center gap-2">
               <Pencil className="w-5 h-5 text-amber-400" />
@@ -1726,6 +1772,9 @@ export default function Buildathon() {
               ? allEventProjects
               : allEventProjects.filter((p) => isProjectVisibleForParticipant(p, event, user?.uid));
             const metrics = getEventPopularityMetrics(event.id, event.participants);
+            const submittedProjectsCount = Number.isFinite(Number(event.submittedProjectsCount))
+              ? Math.max(Number(event.submittedProjectsCount), Number(metrics.submittedProjects || 0))
+              : Number(metrics.submittedProjects || 0);
             const adminSupervisionMetrics = getBuildathonSupervisionMetrics(event, allEventProjects);
             const adminRankingProjects = sortProjectsForEventRanking(event, allEventProjects);
             const integrityWarningsByProject = allEventProjects
@@ -1744,23 +1793,45 @@ export default function Buildathon() {
             const typeLabel = event.type === 'hackathon' ? 'Hackathon' : 'Buildathon';
             const typeIcon = event.type === 'hackathon' ? '💻' : '🏗️';
             const userVotedProject = allEventProjects.find((p) => p.votes?.includes(user?.uid));
+            const coverImageUrl = getEventCoverImageUrl(event);
 
             return (
               <div key={event.id} className="glass-card overflow-hidden">
+                <div className="relative aspect-[16/6] bg-gradient-to-br from-slate-900 via-slate-800 to-slate-950 border-b border-themed overflow-hidden">
+                  <img
+                    src={coverImageUrl}
+                    alt={event.title || 'Couverture de l’événement'}
+                    className="absolute inset-0 h-full w-full object-cover"
+                    onError={(e) => {
+                      e.currentTarget.src = '/icon-512.png';
+                    }}
+                  />
+                  <div className="absolute inset-0 bg-gradient-to-t from-black/70 via-black/20 to-transparent" />
+                  <div className="absolute inset-0 flex items-end p-4 sm:p-6">
+                    <div className="max-w-2xl">
+                      <div className="inline-flex items-center gap-2 px-3 py-1.5 rounded-full border border-white/15 bg-black/35 backdrop-blur-sm text-white text-xs font-medium">
+                        <span>{typeIcon}</span>
+                        <span>{typeLabel}</span>
+                        <span className="opacity-70">•</span>
+                        <span>{statusInfo.label}</span>
+                      </div>
+                      <h2 className="mt-3 text-2xl font-bold text-white drop-shadow-sm line-clamp-1">{event.title}</h2>
+                      <p className="mt-1 text-sm text-white/85 line-clamp-2">{event.description || 'Aucune description disponible.'}</p>
+                    </div>
+                  </div>
+                </div>
                 {/* Event Header */}
                 <div className="p-6">
                   <div className="flex items-start justify-between gap-4">
                     <div className="flex-1 min-w-0">
                       <div className="flex items-center gap-3 mb-2 flex-wrap">
                         <span className="text-2xl">{typeIcon}</span>
-                        <h2 className="text-xl font-bold text-heading">{event.title}</h2>
                         <span className={`badge border ${statusInfo.color}`}>
                           <span className={`w-1.5 h-1.5 rounded-full ${statusInfo.dot} mr-1 inline-block`} />
                           {statusInfo.label}
                         </span>
                         <span className="badge bg-surface text-body border border-themed text-xs">{typeLabel}</span>
                       </div>
-                      <p className="text-body text-sm mb-4 line-clamp-2">{event.description || 'Aucune description disponible.'}</p>
                       <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4 text-xs">
                         <div className="rounded-lg border border-themed bg-black/5 dark:bg-white/5 px-3 py-2">
                           <p className="text-muted mb-1">Début</p>
@@ -1776,7 +1847,7 @@ export default function Buildathon() {
                         </div>
                         <div className="rounded-lg border border-themed bg-black/5 dark:bg-white/5 px-3 py-2">
                           <p className="text-muted mb-1">Projets</p>
-                          <p className="text-heading font-medium">{metrics.submittedProjects}</p>
+                          <p className="text-heading font-medium">{submittedProjectsCount}</p>
                         </div>
                       </div>
                     </div>

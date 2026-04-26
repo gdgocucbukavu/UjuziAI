@@ -58,18 +58,23 @@ function formatDate(value) {
 }
 
 function normalizeEvent(raw) {
+  const mode = raw?.mode === 'jury' || raw?.juryModeEnabled === true || raw?.rankingMode === 'jury'
+    ? 'jury'
+    : 'public';
   return {
     ...raw,
+    mode,
+    rankingMode: mode,
     votingEnabled: raw.votingEnabled !== false,
     participants: Array.isArray(raw.participants) ? raw.participants : [],
     maxVotesPerUser: 1,
     projectVisibility: raw.projectVisibility || 'published-only',
-    juryModeEnabled: raw.juryModeEnabled === true,
+    juryModeEnabled: mode === 'jury',
   };
 }
 
 function getCanonicalProjectStatus(project = {}) {
-  const raw = String(project.projectStatus || '').toLowerCase();
+  const raw = String(project.projectStatus || project.status || '').toLowerCase();
   const normalizedRaw = raw
     .replace('é', 'e')
     .replace('à', 'a')
@@ -95,6 +100,9 @@ function isProjectOwnerOrMember(project, uid) {
 }
 
 function getCanonicalProjectVisibility(event = {}) {
+  const isJuryMode = event?.mode === 'jury' || event?.rankingMode === 'jury' || event?.juryModeEnabled === true;
+  if (isJuryMode) return 'all-submitted';
+
   const raw = String(event?.projectVisibility || '')
     .toLowerCase()
     .replace(/[_\s]+/g, '-')
@@ -301,6 +309,7 @@ export default function BuildathonProjectDetail() {
       },
       () => {
         // Best-effort list, individual project page remains usable.
+        setAllEventProjects([]);
       }
     );
 
@@ -476,7 +485,8 @@ export default function BuildathonProjectDetail() {
       if (result.action === 'removed') {
         toast.success('Vote retiré');
       } else {
-        toast.success(event?.juryModeEnabled
+        const isJuryMode = event?.mode === 'jury' || event?.juryModeEnabled === true || event?.rankingMode === 'jury';
+        toast.success(isJuryMode
           ? 'Vote enregistré (+10 points UjuziAI global)'
           : 'Vote enregistré (impacte le classement Buildathon public)');
       }
@@ -826,6 +836,7 @@ export default function BuildathonProjectDetail() {
     Number(project.commentsCount || 0),
     visibleFeedbackList.length
   );
+  const isJuryMode = event?.mode === 'jury' || event?.juryModeEnabled === true || event?.rankingMode === 'jury';
 
   return (
     <div className="max-w-6xl mx-auto animate-fade-in space-y-6">
@@ -919,11 +930,11 @@ export default function BuildathonProjectDetail() {
       <div className="glass-card p-6 space-y-5">
         <h2 className="text-lg font-semibold text-heading">Actions séparées</h2>
         <p className="text-xs text-muted">
-          Vote = {event?.juryModeEnabled ? 'score global UjuziAI uniquement' : 'impacte le classement Buildathon'};
+          Vote = {isJuryMode ? 'score global UjuziAI uniquement' : 'impacte le classement Buildathon'};
           {' '}Like = score global UjuziAI uniquement; Feedback = discussion uniquement.
         </p>
         <p className="text-xs text-muted">
-          1 vote = 10 points (global UjuziAI). {event?.juryModeEnabled ? 'Le classement Buildathon est basé sur les juges.' : 'Le classement Buildathon public utilise les votes.'}
+          1 vote = 10 points (global UjuziAI). {isJuryMode ? 'Le classement Buildathon est basé sur les juges.' : 'Le classement Buildathon public utilise les votes.'}
         </p>
         <p className="text-xs text-muted">Départage classement: {event?.tieBreakRuleText || 'En cas d\'égalité, le projet soumis le plus tôt est prioritaire.'}</p>
 

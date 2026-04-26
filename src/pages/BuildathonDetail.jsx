@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react';
 import { Link, useParams } from 'react-router-dom';
-import { addDoc, arrayUnion, collection, collectionGroup, doc, getDoc, getDocs, limit, onSnapshot, query, serverTimestamp, setDoc, updateDoc, where } from 'firebase/firestore';
+import { addDoc, arrayUnion, collection, collectionGroup, doc, getDoc, getDocs, increment, limit, onSnapshot, query, serverTimestamp, setDoc, deleteDoc, updateDoc, where } from 'firebase/firestore';
 import { db } from '../lib/firebase';
 import { useAuth } from '../contexts/AuthContext';
 import { ArrowLeft, Calendar, Clock3, Crown, ExternalLink, Eye, FileText, Heart, Loader2, Medal, MessageSquare, Settings, ThumbsUp, Trophy, Users, UserPlus, Send, Star, UserCircle2 } from 'lucide-react';
@@ -130,7 +130,24 @@ function getEventStatus(event) {
   return 'En cours';
 }
 
+function isEventOpenForParticipation(event) {
+  const status = getEventStatus(event);
+  return status === 'À venir' || status === 'En cours';
+}
+
+function isWithinSubmissionWindow(event, nowMs = Date.now()) {
+  const startMs = event?.submissionStartDate ? new Date(event.submissionStartDate).getTime() : null;
+  const endMsRaw = getEffectiveEventEndDate(event);
+  const endMs = endMsRaw ? endMsRaw.getTime() : null;
+
+  if (!Number.isFinite(startMs) && !Number.isFinite(endMs)) return true;
+  if (Number.isFinite(startMs) && nowMs < startMs) return false;
+  if (Number.isFinite(endMs) && nowMs > endMs) return false;
+  return true;
+}
+
 function normalizeBuildathonEvent(raw) {
+  const mode = raw.mode === 'jury' || raw.juryModeEnabled === true || raw.rankingMode === 'jury' ? 'jury' : 'public';
   return {
     ...raw,
     participants: Array.isArray(raw.participants) ? raw.participants : [],
@@ -148,15 +165,16 @@ function normalizeBuildathonEvent(raw) {
     prizes: Array.isArray(raw.prizes) ? raw.prizes : [],
     projectVisibility: raw.projectVisibility || 'published-only',
     publicationStatus: raw.publicationStatus || 'published',
-    juryModeEnabled: raw.juryModeEnabled === true,
+    mode,
+    juryModeEnabled: mode === 'jury',
     juryResultsPublished: raw.juryResultsPublished === true,
-    rankingMode: raw.rankingMode || 'public',
+    rankingMode: mode,
     judgeCriteria: normalizeJudgeCriteria(raw.judgeCriteria),
   };
 }
 
 function getCanonicalProjectStatus(project = {}) {
-  const raw = String(project.projectStatus || '').toLowerCase();
+  const raw = String(project.projectStatus || project.status || '').toLowerCase();
   const normalizedRaw = raw.replace('é', 'e').trim();
   if (normalizedRaw === 'brouillon' || normalizedRaw === 'draft') return 'brouillon';
   if (normalizedRaw === 'soumis' || normalizedRaw === 'submitted' || normalizedRaw === 'pending') return 'soumis';
@@ -171,6 +189,9 @@ function getCanonicalProjectStatus(project = {}) {
 }
 
 function getCanonicalProjectVisibility(event = {}) {
+  const isJuryMode = event?.mode === 'jury' || event?.rankingMode === 'jury' || event?.juryModeEnabled === true;
+  if (isJuryMode) return 'all-submitted';
+
   const raw = String(event?.projectVisibility || '')
     .toLowerCase()
     .replace(/[_\s]+/g, '-')
@@ -191,12 +212,19 @@ function isProjectVisibleForParticipant(project, event, uid) {
   if (isProjectOwnerOrMember(project, uid)) return true;
 
   if (status === 'rejete') return false;
+  
+  // LOGIC FIX: Always show submitted projects if the event is in "jury" mode 
+  // or if projectVisibility is set to 'all-submitted'.
+  // ALSO: If it's currently the submission or voting phase, we should probably 
+  // show submitted projects so participants can see the activity.
   const projectVisibility = getCanonicalProjectVisibility(event);
+  const isJuryMode = event?.mode === 'jury' || event?.rankingMode === 'jury' || event?.juryModeEnabled === true;
 
-  if (projectVisibility === 'all-submitted') {
+  if (isJuryMode || projectVisibility === 'all-submitted') {
     return status === 'soumis' || status === 'valide' || status === 'publie';
   }
 
+  // Fallback: only published projects
   return status === 'publie';
 }
 
@@ -210,6 +238,19 @@ function getProjectVisual(project = {}) {
   ].find((value) => typeof value === 'string' && value.trim());
 
   return candidate ? candidate.trim() : null;
+}
+
+function getEventCoverImageUrl(event = {}) {
+  const value = String(event?.coverImageUrl || '').trim();
+  if (!value) return '/icon-512.png';
+
+  try {
+    const parsedUrl = new URL(value);
+    if (parsedUrl.protocol !== 'https:') return '/icon-512.png';
+    return parsedUrl.toString();
+  } catch {
+    return '/icon-512.png';
+  }
 }
 
 function getInitialsLabel(input) {
@@ -427,51 +468,115 @@ export default function BuildathonDetail() {
       }
     );
 
-    const projectsRef = query(collection(db, 'buildathonProjects'), where('buildathonId', '==', buildathonId));
-    const unsubProjects = onSnapshot(projectsRef, (snap) => {
-      const data = [];
-      snap.forEach((d) => data.push(normalizeBuildathonProject({ id: d.id, ...d.data() })));
-      setProjects(data);
-    });
+    return () => {
+      unsubEvent();
+    };
+  }, [buildathonId]);
 
-    let unsubJudgeScores = () => {};
-    if (isAdmin) {
-      const judgeScoresRef = query(collectionGroup(db, 'judgeScores'), where('buildathonId', '==', buildathonId));
-      unsubJudgeScores = onSnapshot(judgeScoresRef, (snap) => {
-        const grouped = {};
-        snap.forEach((d) => {
-          const score = d.data() || {};
-          if (!score.projectId) return;
-          if (!grouped[score.projectId]) {
-            grouped[score.projectId] = [];
-          }
-          grouped[score.projectId].push(score);
-        });
-
-        const aggregate = {};
-        Object.keys(grouped).forEach((projectId) => {
-          const scores = grouped[projectId]
-            .map((item) => Number(item.totalScore))
-            .filter((value) => Number.isFinite(value));
-          const judgeScoreCount = scores.length;
-          const judgeScoreTotal = scores.reduce((sum, value) => sum + value, 0);
-          const judgeScoreAverage = judgeScoreCount > 0 ? judgeScoreTotal / judgeScoreCount : 0;
-          aggregate[projectId] = {
-            judgeScoreCount,
-            judgeScoreTotal,
-            judgeScoreAverage,
-          };
-        });
-        setJudgeScoresByProject(aggregate);
-      }, () => {
-        setJudgeScoresByProject({});
-      });
-    } else {
-      setJudgeScoresByProject({});
+  useEffect(() => {
+    if (!buildathonId) return;
+    if (!isAdmin && !event) {
+      setProjects([]);
+      return;
     }
 
+    const normalizeFromSnapshot = (snap) => {
+      const list = [];
+      snap.forEach((d) => {
+        list.push(normalizeBuildathonProject({ id: d.id, ...d.data() }));
+      });
+      return list;
+    };
+
+    const emitProjects = (nextProjects) => {
+      if (import.meta.env.DEV) {
+        console.info('[BuildathonDetail] project query', {
+          buildathonId,
+          visibility: getCanonicalProjectVisibility(event || {}),
+          isAdmin,
+          eventProjectVisibility: event?.projectVisibility || null,
+          projectCount: nextProjects.length,
+          projects: nextProjects.map((project) => ({
+            id: project.id,
+            buildathonId: project.buildathonId,
+            status: project.status || null,
+            projectStatus: project.projectStatus || null,
+            moderationStatus: project.moderationStatus || null,
+            isPublished: project.isPublished === true,
+            submittedBy: project.submittedBy || null,
+            submittedAt: project.submittedAt || null,
+          })),
+        });
+      }
+      setProjects(nextProjects);
+    };
+
+    const projectsRef = query(collection(db, 'buildathonProjects'), where('buildathonId', '==', buildathonId));
+    const unsubscribeProjects = onSnapshot(
+      projectsRef,
+      (snap) => {
+        const nextProjects = normalizeFromSnapshot(snap);
+        emitProjects(nextProjects);
+      },
+      (error) => {
+        if (import.meta.env.DEV) {
+          console.error('[BuildathonDetail] project query error', {
+            buildathonId,
+            message: error?.message || String(error),
+            code: error?.code || null,
+          });
+        }
+        setProjects([]);
+      }
+    );
+
+    return () => {
+      unsubscribeProjects();
+    };
+  }, [buildathonId, isAdmin, event?.id, event?.projectVisibility]);
+
+  useEffect(() => {
+    if (!buildathonId || !isAdmin) {
+      setJudgeScoresByProject({});
+      return;
+    }
+
+    const judgeScoresRef = query(collectionGroup(db, 'judgeScores'), where('buildathonId', '==', buildathonId));
+    const unsubscribe = onSnapshot(judgeScoresRef, (snap) => {
+      const grouped = {};
+      snap.forEach((d) => {
+        const score = d.data() || {};
+        if (!score.projectId) return;
+        if (!grouped[score.projectId]) {
+          grouped[score.projectId] = [];
+        }
+        grouped[score.projectId].push(score);
+      });
+
+      const aggregate = {};
+      Object.keys(grouped).forEach((projectId) => {
+        const scores = grouped[projectId]
+          .map((item) => Number(item.totalScore))
+          .filter((value) => Number.isFinite(value));
+        const judgeScoreCount = scores.length;
+        const judgeScoreTotal = scores.reduce((sum, value) => sum + value, 0);
+        const judgeScoreAverage = judgeScoreCount > 0 ? judgeScoreTotal / judgeScoreCount : 0;
+        aggregate[projectId] = {
+          judgeScoreCount,
+          judgeScoreTotal,
+          judgeScoreAverage,
+        };
+      });
+      setJudgeScoresByProject(aggregate);
+    }, () => setJudgeScoresByProject({}));
+
+    return () => unsubscribe();
+  }, [buildathonId, isAdmin]);
+
+  useEffect(() => {
+    if (!buildathonId) return;
+
     let unsubJudgeInvitations = () => {};
-    let unsubJudges = () => {};
     if (isAdmin) {
       const judgeInvitationsRef = collection(db, 'buildathons', buildathonId, 'judgeInvitations');
       unsubJudgeInvitations = onSnapshot(judgeInvitationsRef, (snap) => {
@@ -480,37 +585,48 @@ export default function BuildathonDetail() {
         data.sort((a, b) => String(a?.inviteeLabel || '').localeCompare(String(b?.inviteeLabel || '')));
         setJudgeInvitations(data);
       }, () => setJudgeInvitations([]));
+    } else {
+      setJudgeInvitations([]);
+    }
 
+    const shouldSubscribeJudges = isAdmin || (event?.mode === 'jury' || event?.juryModeEnabled === true || event?.rankingMode === 'jury');
+    let unsubJudges = () => {};
+    if (shouldSubscribeJudges) {
       const judgesRef = collection(db, 'buildathons', buildathonId, 'judges');
       unsubJudges = onSnapshot(judgesRef, (snap) => {
         const data = [];
-        snap.forEach((d) => data.push({ id: d.id, ...d.data() }));
+        snap.forEach((d) => {
+          const judge = { id: d.id, ...d.data() };
+          if (judge?.active === true || isAdmin) {
+            data.push(judge);
+          }
+        });
         data.sort((a, b) => String(a?.displayName || a?.email || '').localeCompare(String(b?.displayName || b?.email || '')));
         setActiveJudges(data);
       }, () => setActiveJudges([]));
     } else {
-      setJudgeInvitations([]);
       setActiveJudges([]);
     }
 
     return () => {
-      unsubEvent();
-      unsubProjects();
-      unsubJudgeScores();
       unsubJudgeInvitations();
       unsubJudges();
     };
-  }, [buildathonId, isAdmin]);
+  }, [buildathonId, isAdmin, event?.mode, event?.juryModeEnabled, event?.rankingMode]);
 
   useEffect(() => {
-    setJuryModeEnabled(event?.juryModeEnabled === true);
+    setJuryModeEnabled(event?.mode === 'jury' || event?.juryModeEnabled === true || event?.rankingMode === 'jury');
     setJuryResultsPublished(event?.juryResultsPublished === true);
     const criteria = normalizeJudgeCriteria(event?.judgeCriteria);
     const asText = criteria.map((criterion) => criterion.label).join('\n');
     setJudgeCriteriaDraft(asText);
-  }, [event?.id, event?.juryModeEnabled, event?.juryResultsPublished, event?.judgeCriteria]);
+  }, [event?.id, event?.mode, event?.juryModeEnabled, event?.juryResultsPublished, event?.judgeCriteria, event?.rankingMode]);
 
   const handleRegister = async () => {
+    if (!isEventOpenForParticipation(event)) {
+      alert('Les inscriptions sont fermées pour ce buildathon terminé.');
+      return;
+    }
     try {
       await updateDoc(doc(db, 'buildathons', buildathonId), {
         participants: arrayUnion(user.uid),
@@ -522,6 +638,14 @@ export default function BuildathonDetail() {
 
   const handleSubmitProject = async (e) => {
     e.preventDefault();
+    if (!isEventOpenForParticipation(event)) {
+      alert('Les soumissions sont fermées pour ce buildathon terminé.');
+      return;
+    }
+    if (event?.submissionOpen === false) {
+      alert('Les soumissions sont actuellement fermées pour ce buildathon.');
+      return;
+    }
     if (!submitFormData.title || !submitFormData.teamName || !submitFormData.repoUrl || !submitFormData.demoUrl) {
       alert('Veuillez remplir tous les champs obligatoires');
       return;
@@ -555,6 +679,7 @@ export default function BuildathonDetail() {
         commentsCount: 0,
         feedbackCount: 0,
         projectStatus: 'soumis',
+        status: 'soumis',
         moderationStatus: 'pending',
         isPublished: false,
         isPublic: false,
@@ -567,8 +692,15 @@ export default function BuildathonDetail() {
       setSubmitFormData({ title: '', description: '', category: '', teamName: '', repoUrl: '', demoUrl: '' });
       setActiveTab('projects');
     } catch (error) {
+      if (import.meta.env.DEV) {
+        console.error('[BuildathonDetail] submit project error', {
+          buildathonId,
+          message: error?.message || String(error),
+          code: error?.code || null,
+        });
+      }
       console.error('Erreur:', error);
-      alert('Erreur lors de la soumission du projet');
+      alert(error?.message ? `Erreur lors de la soumission du projet: ${error.message}` : 'Erreur lors de la soumission du projet');
     } finally {
       setSubmitting(false);
     }
@@ -577,18 +709,51 @@ export default function BuildathonDetail() {
   const resolveUserByIdentifier = async (identifier) => {
     const raw = String(identifier || '').trim();
     if (!raw) return null;
+    const lowered = raw.toLowerCase();
 
     if (raw.includes('@')) {
       const byEmailSnap = await getDocs(query(collection(db, 'users'), where('email', '==', raw), limit(1)));
       if (!byEmailSnap.empty) {
         const docSnap = byEmailSnap.docs[0];
-        return { id: docSnap.id, ...docSnap.data() };
+        const data = docSnap.data() || {};
+        return {
+          id: docSnap.id,
+          authUid: docSnap.id,
+          legacyUid: data.uid || data.userId || data.authUid || null,
+          email: data.email || raw,
+          ...data,
+        };
       }
+
+      const usersSnap = await getDocs(collection(db, 'users'));
+      let fallbackUser = null;
+      usersSnap.forEach((snap) => {
+        if (fallbackUser) return;
+        const data = snap.data() || {};
+        const email = String(data.email || '').toLowerCase();
+        if (email === lowered) {
+          fallbackUser = {
+            id: snap.id,
+            authUid: snap.id,
+            legacyUid: data.uid || data.userId || data.authUid || null,
+            email: data.email || raw,
+            ...data,
+          };
+        }
+      });
+      if (fallbackUser) return fallbackUser;
     }
 
     const byIdSnap = await getDoc(doc(db, 'users', raw));
     if (byIdSnap.exists()) {
-      return { id: byIdSnap.id, ...byIdSnap.data() };
+      const data = byIdSnap.data() || {};
+      return {
+        id: byIdSnap.id,
+        authUid: byIdSnap.id,
+        legacyUid: data.uid || data.userId || data.authUid || null,
+        email: data.email || null,
+        ...data,
+      };
     }
 
     return null;
@@ -605,22 +770,75 @@ export default function BuildathonDetail() {
         return;
       }
 
-      const invitationRef = doc(db, 'buildathons', event.id, 'judgeInvitations', targetUser.id);
-      await setDoc(invitationRef, {
+      // DEBUG: Log the resolved user to see what UID we are using
+      console.info('[DEBUG] Judge invitation - Resolved user:', {
+        identifier: judgeIdentifier,
+        resolvedUid: targetUser.id,
+        email: targetUser.email,
+        displayName: targetUser.displayName
+      });
+
+      const invitationData = {
         buildathonId: event.id,
         buildathonTitle: event.title || 'Buildathon',
-        inviteeUid: targetUser.id,
+        inviteeUid: targetUser.authUid || targetUser.id,
+        invitedUid: targetUser.authUid || targetUser.id,
+        inviteeLegacyUid: targetUser.legacyUid || null,
+        invitedLegacyUid: targetUser.legacyUid || null,
         inviteeLabel: targetUser.displayName || targetUser.email || targetUser.id,
-        inviteeEmail: targetUser.email || null,
+        inviteeEmail: targetUser.email || judgeIdentifier.trim() || null,
+        inviteeEmailLower: (targetUser.email || judgeIdentifier.trim()) ? String(targetUser.email || judgeIdentifier.trim()).toLowerCase() : null,
+        invitedEmail: targetUser.email || judgeIdentifier.trim() || null,
+        invitedEmailLower: (targetUser.email || judgeIdentifier.trim()) ? String(targetUser.email || judgeIdentifier.trim()).toLowerCase() : null,
         invitedBy: user?.uid || null,
         status: 'pending',
         createdAt: serverTimestamp(),
         updatedAt: serverTimestamp(),
-      }, { merge: true });
+      };
 
+      const invitationDocId = targetUser.authUid || targetUser.id;
+      const invRef1 = doc(db, 'buildathons', event.id, 'invitations', invitationDocId);
+      const invRef2 = doc(db, 'buildathons', event.id, 'judgeInvitations', invitationDocId);
+
+      const writeResults = await Promise.allSettled([
+        setDoc(invRef1, invitationData, { merge: true }),
+        setDoc(invRef2, invitationData, { merge: true }),
+      ]);
+
+      const successCount = writeResults.filter((result) => result.status === 'fulfilled').length;
+      if (successCount === 0) {
+        const firstFailure = writeResults.find((result) => result.status === 'rejected');
+        throw firstFailure?.reason || new Error('Invitation write failed');
+      }
+
+      if (import.meta.env.DEV) {
+        const failures = writeResults
+          .filter((result) => result.status === 'rejected')
+          .map((result) => result.reason?.message || String(result.reason));
+        if (failures.length > 0) {
+          console.warn('[BuildathonDetail] partial invitation write failure', failures);
+        }
+      }
+
+      console.info('[DEBUG] Judge invitation created successfully at:', invRef1.path);
       setJudgeIdentifier('');
+      alert('Invitation envoyee');
     } catch (error) {
-      alert('Erreur lors de l\'invitation du juge');
+      console.error('[DEBUG] Error inviting judge:', error);
+      const errorCode = error?.code ? String(error.code) : 'unknown';
+      const errorMessage = error?.message
+        ? String(error.message)
+        : (typeof error === 'string' ? error : JSON.stringify(error));
+      const errorStack = error?.stack ? String(error.stack) : 'n/a';
+      const debugMessage = [
+        'Invitation juge échouée',
+        `code: ${errorCode}`,
+        `message: ${errorMessage || 'n/a'}`,
+        `stack: ${errorStack}`,
+        `buildathonId: ${event?.id || 'n/a'}`,
+        `invitee: ${judgeIdentifier || 'n/a'}`,
+      ].join('\n');
+      alert(debugMessage);
     } finally {
       setInvitingJudge(false);
     }
@@ -641,6 +859,7 @@ export default function BuildathonDetail() {
     setJuryConfigSaving(true);
     try {
       await updateDoc(doc(db, 'buildathons', event.id), {
+        mode: juryModeEnabled ? 'jury' : 'public',
         juryModeEnabled,
         juryResultsPublished,
         rankingMode: juryModeEnabled ? 'jury' : 'public',
@@ -664,7 +883,15 @@ export default function BuildathonDetail() {
   }, [projects, event, user?.uid, isAdmin]);
 
   const sortedProjects = useMemo(() => sortProjectsForRanking(visibleProjects), [visibleProjects]);
-  const rankingMode = event?.juryModeEnabled === true || event?.rankingMode === 'jury' ? 'jury' : 'public';
+  const submittedProjectsCount = useMemo(() => {
+    const storedCount = Number(event?.submittedProjectsCount);
+    const derivedCount = projects.filter((project) => getCanonicalProjectStatus(project) !== 'brouillon').length;
+    if (Number.isFinite(storedCount) && storedCount >= 0) {
+      return Math.max(storedCount, derivedCount);
+    }
+    return derivedCount;
+  }, [event?.submittedProjectsCount, projects]);
+  const rankingMode = event?.mode === 'jury' || event?.juryModeEnabled === true || event?.rankingMode === 'jury' ? 'jury' : 'public';
   const canRevealJuryRanking = rankingMode !== 'jury' || juryResultsPublished || isAdmin;
   const rankingProjects = useMemo(() => {
     const withJudgeMetrics = visibleProjects.map((project) => {
@@ -722,6 +949,28 @@ export default function BuildathonDetail() {
     [event?.voteStartDate, event?.voteEndDate, nowMs]
   );
 
+  useEffect(() => {
+    if (!isAdmin || !event?.id) return;
+
+    const submittedCount = projects.filter((project) => getCanonicalProjectStatus(project) !== 'brouillon').length;
+    const publishedCount = projects.filter((project) => getCanonicalProjectStatus(project) === 'publie').length;
+
+    const currentSubmitted = Number(event?.submittedProjectsCount);
+    const currentPublished = Number(event?.publishedProjectsCount);
+    const hasSubmittedDrift = !Number.isFinite(currentSubmitted) || currentSubmitted !== submittedCount;
+    const hasPublishedDrift = !Number.isFinite(currentPublished) || currentPublished !== publishedCount;
+
+    if (!hasSubmittedDrift && !hasPublishedDrift) return;
+
+    updateDoc(doc(db, 'buildathons', event.id), {
+      submittedProjectsCount: submittedCount,
+      publishedProjectsCount: publishedCount,
+      updatedAt: serverTimestamp(),
+    }).catch(() => {
+      // Silent sync: UI remains usable even if counter update fails.
+    });
+  }, [isAdmin, event?.id, event?.submittedProjectsCount, event?.publishedProjectsCount, projects]);
+
   if (loading) {
     return (
       <div className="max-w-6xl mx-auto py-10 space-y-4">
@@ -755,9 +1004,38 @@ export default function BuildathonDetail() {
   }
 
   const status = getEventStatus(event);
+  const canParticipate = isEventOpenForParticipation(event);
 
   return (
     <div className="max-w-6xl mx-auto animate-fade-in">
+      <div className="glass-card overflow-hidden mb-6">
+        <div className="relative aspect-[16/6] bg-gradient-to-br from-slate-900 via-slate-800 to-slate-950 border-b border-themed overflow-hidden">
+          <img
+            src={getEventCoverImageUrl(event)}
+            alt={event.title || 'Couverture du Buildathon'}
+            className="absolute inset-0 h-full w-full object-cover"
+            onError={(e) => {
+              e.currentTarget.src = '/icon-512.png';
+            }}
+          />
+          <div className="absolute inset-0 bg-gradient-to-t from-black/75 via-black/20 to-transparent" />
+          <div className="absolute inset-0 flex items-end p-4 sm:p-6">
+            <div className="max-w-3xl">
+              <div className="inline-flex items-center gap-2 px-3 py-1.5 rounded-full border border-white/15 bg-black/35 backdrop-blur-sm text-white text-xs font-medium">
+                <span>{event.type === 'hackathon' ? '💻' : '🏗️'}</span>
+                <span>{event.type === 'hackathon' ? 'Hackathon' : 'Buildathon'}</span>
+                <span className="opacity-70">•</span>
+                <span>{status}</span>
+                <span className="opacity-70">•</span>
+                <span>{event.mode === 'jury' || event.juryModeEnabled ? 'Mode jury' : 'Mode public'}</span>
+              </div>
+              <h1 className="mt-3 text-2xl sm:text-4xl font-bold text-white drop-shadow-sm">{event.title}</h1>
+              <p className="mt-2 text-sm sm:text-base text-white/85 max-w-2xl">{event.description || 'Aucune description disponible pour cet événement.'}</p>
+            </div>
+          </div>
+        </div>
+      </div>
+
       <div className="mb-6">
         <Link to="/projects" className="inline-flex items-center gap-2 text-sm text-primary-400 hover:text-primary-300 mb-4">
           <ArrowLeft className="w-4 h-4" />
@@ -766,13 +1044,11 @@ export default function BuildathonDetail() {
 
         <div className="glass-card p-6">
           <div className="flex flex-col gap-3">
-            <h1 className="text-2xl font-bold text-heading">{event.title}</h1>
-            <p className="text-body line-clamp-3">{event.description || 'Aucune description disponible.'}</p>
             <div className="flex flex-wrap items-center gap-4 text-xs text-muted">
               <span className="inline-flex items-center gap-1"><Calendar className="w-3.5 h-3.5" />{formatEventDate(event.startDate)} → {formatEventDate(getEffectiveEventEndDate(event))}</span>
               <span className="inline-flex items-center gap-1"><Clock3 className="w-3.5 h-3.5" />{formatEventDate(event.submissionStartDate)} → {formatEventDate(getEffectiveEventEndDate(event))}</span>
               <span className="inline-flex items-center gap-1"><Users className="w-3.5 h-3.5" />{event.participants.length} participant{event.participants.length > 1 ? 's' : ''}</span>
-              <span className="inline-flex items-center gap-1"><FileText className="w-3.5 h-3.5" />{projects.length} projet{projects.length > 1 ? 's' : ''}</span>
+              <span className="inline-flex items-center gap-1"><FileText className="w-3.5 h-3.5" />{submittedProjectsCount} projet{submittedProjectsCount > 1 ? 's' : ''} soumis</span>
               <span className={`inline-flex items-center gap-1 ${event.votingEnabled ? 'text-green-400' : 'text-red-400'}`}>
                 <ThumbsUp className="w-3.5 h-3.5" />
                 Vote {event.votingEnabled ? 'activé' : 'désactivé'}
@@ -790,7 +1066,7 @@ export default function BuildathonDetail() {
               </div>
             </div>
             <div className="flex items-center gap-2 flex-wrap pt-2 border-t border-themed mt-3">
-              {!event.participants.includes(user?.uid) && (
+              {!event.participants.includes(user?.uid) && canParticipate && (
                 <button
                   onClick={handleRegister}
                   className="flex items-center gap-1.5 text-sm px-3 py-1.5 rounded-lg bg-accent-600/20 text-accent-300 border border-accent-500/30 hover:bg-accent-600/30 transition-colors"
@@ -802,7 +1078,7 @@ export default function BuildathonDetail() {
               {event.participants.includes(user?.uid) && (
                 <span className="text-xs text-green-400 flex items-center gap-1">✓ Inscrit</span>
               )}
-              {event.participants.includes(user?.uid) && !projects.some((p) => p.submittedBy === user?.uid) && (
+              {event.participants.includes(user?.uid) && canParticipate && !projects.some((p) => p.submittedBy === user?.uid) && (
                 <button
                   onClick={() => setActiveTab('submit')}
                   className="flex items-center gap-1.5 text-sm px-3 py-1.5 rounded-lg bg-primary-600/20 text-primary-300 border border-primary-500/30 hover:bg-primary-600/30 transition-colors"
@@ -841,7 +1117,7 @@ export default function BuildathonDetail() {
         {activeTab === 'overview' && (
           <div className="space-y-4">
             <h2 className="text-lg font-semibold text-heading">Aperçu</h2>
-            <p className="text-body">{event.description || 'Aucune description disponible pour cet événement.'}</p>
+            <p className="text-body whitespace-pre-wrap break-words">{event.description || 'Aucune description disponible pour cet événement.'}</p>
             <div className="grid sm:grid-cols-2 lg:grid-cols-4 gap-3">
               <div className="p-3 rounded-lg bg-black/5 dark:bg-white/5 border border-themed">
                 <p className="text-xs text-muted">Statut</p>
@@ -849,7 +1125,7 @@ export default function BuildathonDetail() {
               </div>
               <div className="p-3 rounded-lg bg-black/5 dark:bg-white/5 border border-themed">
                 <p className="text-xs text-muted">Projets soumis</p>
-                <p className="text-sm font-medium text-heading">{projects.length}</p>
+                <p className="text-sm font-medium text-heading">{submittedProjectsCount}</p>
               </div>
               <div className="p-3 rounded-lg bg-black/5 dark:bg-white/5 border border-themed">
                 <p className="text-xs text-muted">Vote</p>
@@ -860,6 +1136,39 @@ export default function BuildathonDetail() {
                 <p className="text-sm font-medium text-heading">{event.publicationStatus || 'published'}</p>
               </div>
             </div>
+
+            {rankingMode === 'jury' && (
+              <div className="p-4 rounded-lg bg-black/5 dark:bg-white/5 border border-themed space-y-2">
+                <p className="text-sm font-semibold text-heading">Jury Buildathon</p>
+                <p className="text-sm text-body">Le classement final est basé sur les notes des juges.</p>
+                <p className="text-xs text-muted">Juges actifs: {formatNumber(activeJudges.length)}</p>
+                {activeJudges.length > 0 && (
+                  <div className="flex flex-wrap gap-2">
+                    {activeJudges.slice(0, 6).map((judge) => (
+                      <span key={judge.id} className="text-[11px] px-2.5 py-1 rounded-full border border-themed bg-surface text-body">
+                        {judge.displayName || judge.email || judge.userId || 'Juge'}
+                      </span>
+                    ))}
+                  </div>
+                )}
+                {!juryResultsPublished && (
+                  <p className="text-xs text-muted">Les notes détaillées restent masquées jusqu'a la publication officielle des résultats jury.</p>
+                )}
+              </div>
+            )}
+
+            {isAdmin && rankingMode === 'jury' && (
+              <div className="rounded-lg border border-primary-500/30 bg-primary-600/10 p-3 flex items-center justify-between gap-3 flex-wrap">
+                <p className="text-xs text-primary-200">Gestion du jury disponible dans l'onglet Gestion.</p>
+                <button
+                  type="button"
+                  onClick={() => setActiveTab('management')}
+                  className="text-xs px-3 py-1.5 rounded-lg border border-primary-500/30 bg-primary-600/20 text-primary-200"
+                >
+                  Ouvrir Gestion jury
+                </button>
+              </div>
+            )}
 
             {event.rewardsVisible && event.prizes.length > 0 && (
               <div className="p-4 rounded-lg bg-black/5 dark:bg-white/5 border border-themed space-y-2">
@@ -911,7 +1220,22 @@ export default function BuildathonDetail() {
           <div className="space-y-3">
             <h2 className="text-lg font-semibold text-heading">Projets</h2>
             {sortedProjects.length === 0 ? (
-              <p className="text-body">Aucun projet pour le moment.</p>
+              <div className="space-y-1">
+                <p className="text-body">Aucun projet visible pour le moment.</p>
+                {!isAdmin && (
+                  <p className="text-xs text-muted">
+                    Visibilité actuelle: {getCanonicalProjectVisibility(event) === 'all-submitted' ? 'Tous les projets soumis' : 'Projets publiés uniquement'}.
+                    {isWithinSubmissionWindow(event, nowMs)
+                      ? ' La phase de soumission est en cours.'
+                      : ' La phase de soumission est terminée.'}
+                  </p>
+                )}
+                {!isAdmin && submittedProjectsCount > 0 && (
+                  <p className="text-xs text-muted">
+                    {submittedProjectsCount} projet{submittedProjectsCount > 1 ? 's' : ''} soumis au total pour cet evenement.
+                  </p>
+                )}
+              </div>
             ) : (
               <div className="grid md:grid-cols-2 gap-4">
                 {sortedProjects.map((p) => {
@@ -1256,7 +1580,7 @@ export default function BuildathonDetail() {
           <div className="space-y-4">
             <div className="flex items-center justify-between gap-3 flex-wrap">
               <h2 className="text-lg font-semibold text-heading">Soumettre un projet</h2>
-              {!event.participants.includes(user?.uid) && (
+              {!event.participants.includes(user?.uid) && canParticipate && (
                 <button onClick={handleRegister} className="btn-primary text-sm inline-flex items-center gap-1">
                   <UserPlus className="w-3.5 h-3.5" />
                   S'inscrire d'abord
@@ -1264,7 +1588,9 @@ export default function BuildathonDetail() {
               )}
             </div>
 
-            {!event.participants.includes(user?.uid) ? (
+            {!canParticipate ? (
+              <p className="text-body">Ce buildathon est terminé: inscriptions et soumissions sont fermées.</p>
+            ) : !event.participants.includes(user?.uid) ? (
               <p className="text-body">Vous devez d'abord vous inscrire au buildathon pour soumettre un projet.</p>
             ) : (
               <form onSubmit={handleSubmitProject} className="space-y-3">
@@ -1370,15 +1696,15 @@ export default function BuildathonDetail() {
             <div className="space-y-3">
               <div className="p-3 rounded-lg bg-black/5 dark:bg-white/5 border border-themed">
                 <p className="text-xs text-muted mb-1">Participation</p>
-                <p className="text-sm text-body">{event.participationRules || 'Aucune règle de participation détaillée pour cet événement.'}</p>
+                <p className="text-sm text-body whitespace-pre-wrap break-words">{event.participationRules || 'Aucune règle de participation détaillée pour cet événement.'}</p>
               </div>
               <div className="p-3 rounded-lg bg-black/5 dark:bg-white/5 border border-themed">
                 <p className="text-xs text-muted mb-1">Critères d'évaluation</p>
-                <p className="text-sm text-body">{event.evaluationCriteria || 'Aucun critère d\'évaluation détaillé pour cet événement.'}</p>
+                <p className="text-sm text-body whitespace-pre-wrap break-words">{event.evaluationCriteria || 'Aucun critère d\'évaluation détaillé pour cet événement.'}</p>
               </div>
               <div className="p-3 rounded-lg bg-black/5 dark:bg-white/5 border border-themed">
                 <p className="text-xs text-muted mb-1">Règle de départage</p>
-                <p className="text-sm text-body">{event.tieBreakRuleText}</p>
+                <p className="text-sm text-body whitespace-pre-wrap break-words">{event.tieBreakRuleText}</p>
               </div>
             </div>
           </div>
@@ -1390,100 +1716,159 @@ export default function BuildathonDetail() {
               <Settings className="w-5 h-5 text-primary-400" />
               Gestion
             </h2>
-            <p className="text-body">Administration jury Buildathon: activation, critères, invitations et suivi des évaluations.</p>
+            <p className="text-body">Administration Buildathon: activation du mode jury, critères, invitations et suivi des évaluations.</p>
 
             <div className="rounded-xl border border-themed bg-black/5 dark:bg-white/5 p-4 space-y-3">
-              <h3 className="text-sm font-semibold text-heading">Configuration du mode jury</h3>
-              <div className="grid md:grid-cols-2 gap-3 text-sm">
-                <label className="inline-flex items-center gap-2 text-body">
-                  <input
-                    type="checkbox"
-                    checked={juryModeEnabled}
-                    onChange={(e) => setJuryModeEnabled(e.target.checked)}
-                  />
-                  Activer le mode jury (classement Buildathon basé sur les notes des juges)
-                </label>
-                <label className="inline-flex items-center gap-2 text-body">
-                  <input
-                    type="checkbox"
-                    checked={juryResultsPublished}
-                    onChange={(e) => setJuryResultsPublished(e.target.checked)}
-                  />
-                  Publier les résultats jury
-                </label>
-              </div>
-              <div>
-                <label className="text-xs text-muted">Critères jury (une ligne = un critère, max 100 par critère)</label>
-                <textarea
-                  value={judgeCriteriaDraft}
-                  onChange={(e) => setJudgeCriteriaDraft(e.target.value)}
-                  className="input-field w-full h-32 mt-1 resize-none"
-                  placeholder={'Innovation\nImpact\nQualité technique\nClarté du projet\nDesign / UX\nDéploiement sur Cloud Run'}
-                />
-              </div>
-              <div className="flex justify-end">
-                <button
-                  type="button"
-                  onClick={handleSaveJuryConfig}
-                  disabled={juryConfigSaving}
-                  className="px-4 py-2 rounded-lg border border-primary-500/30 bg-primary-600/20 text-primary-200 text-sm disabled:opacity-60"
-                >
-                  {juryConfigSaving ? 'Sauvegarde...' : 'Enregistrer la configuration jury'}
-                </button>
-              </div>
-            </div>
-
-            <div className="rounded-xl border border-themed bg-black/5 dark:bg-white/5 p-4 space-y-3">
-              <h3 className="text-sm font-semibold text-heading">Inviter un juge</h3>
-              <div className="flex gap-2 flex-wrap">
-                <input
-                  type="text"
-                  value={judgeIdentifier}
-                  onChange={(e) => setJudgeIdentifier(e.target.value)}
-                  className="input-field flex-1 min-w-[220px]"
-                  placeholder="Email ou UID utilisateur"
-                />
-                <button
-                  type="button"
-                  onClick={handleInviteJudge}
-                  disabled={invitingJudge || !judgeIdentifier.trim()}
-                  className="px-4 py-2 rounded-lg border border-primary-500/30 bg-primary-600/20 text-primary-200 text-sm disabled:opacity-60"
-                >
-                  {invitingJudge ? 'Invitation...' : 'Inviter'}
-                </button>
+              <div className="flex items-center justify-between gap-3 flex-wrap">
+                <div>
+                  <h3 className="text-sm font-semibold text-heading">Configuration du mode jury</h3>
+                  <p className="text-xs text-muted">Le mode courant est {rankingMode === 'jury' ? 'Jury' : 'Public'}.</p>
+                </div>
+                <span className={`px-3 py-1 rounded-full text-xs font-medium border ${rankingMode === 'jury' ? 'border-primary-500/30 bg-primary-500/10 text-primary-200' : 'border-themed bg-black/10 text-muted'}`}>
+                  {rankingMode === 'jury' ? 'Mode jury actif' : 'Mode public actif'}
+                </span>
               </div>
 
-              <div className="grid md:grid-cols-2 gap-3 text-xs">
-                <div className="rounded-lg border border-themed p-3 bg-black/10 dark:bg-white/10">
-                  <p className="text-muted mb-2">Invitations juges</p>
-                  {judgeInvitations.length === 0 ? (
-                    <p className="text-muted">Aucune invitation envoyée.</p>
-                  ) : (
-                    <div className="space-y-1">
-                      {judgeInvitations.map((invitation) => (
-                        <p key={invitation.id} className="text-body">
-                          {invitation.inviteeLabel || invitation.inviteeEmail || invitation.inviteeUid} - {invitation.status || 'pending'}
-                        </p>
-                      ))}
-                    </div>
-                  )}
+              {rankingMode === 'jury' ? (
+                <>
+                  <div className="grid md:grid-cols-2 gap-3 text-sm">
+                    <label className="inline-flex items-center gap-2 text-body">
+                      <input
+                        type="checkbox"
+                        checked={juryModeEnabled}
+                        onChange={(e) => setJuryModeEnabled(e.target.checked)}
+                      />
+                      Activer le mode jury (classement Buildathon basé sur les notes des juges)
+                    </label>
+                    <label className="inline-flex items-center gap-2 text-body">
+                      <input
+                        type="checkbox"
+                        checked={juryResultsPublished}
+                        onChange={(e) => setJuryResultsPublished(e.target.checked)}
+                      />
+                      Publier les résultats jury
+                    </label>
+                  </div>
+                  <div>
+                    <label className="text-xs text-muted">Critères jury (une ligne = un critère, max 100 par critère)</label>
+                    <textarea
+                      value={judgeCriteriaDraft}
+                      onChange={(e) => setJudgeCriteriaDraft(e.target.value)}
+                      className="input-field w-full h-32 mt-1 resize-none"
+                      placeholder={'Innovation\nImpact\nQualité technique\nClarté du projet\nDesign / UX\nDéploiement sur Cloud Run'}
+                    />
+                  </div>
+                  <div className="flex justify-end">
+                    <button
+                      type="button"
+                      onClick={handleSaveJuryConfig}
+                      disabled={juryConfigSaving}
+                      className="px-4 py-2 rounded-lg border border-primary-500/30 bg-primary-600/20 text-primary-200 text-sm disabled:opacity-60"
+                    >
+                      {juryConfigSaving ? 'Sauvegarde...' : 'Enregistrer la configuration jury'}
+                    </button>
+                  </div>
+                </>
+              ) : (
+                <div className="rounded-lg border border-dashed border-themed p-4 text-sm text-body">
+                  Active le mode jury dans la configuration du Buildathon pour afficher ici la gestion des juges.
                 </div>
-                <div className="rounded-lg border border-themed p-3 bg-black/10 dark:bg-white/10">
-                  <p className="text-muted mb-2">Juges actifs</p>
-                  {activeJudges.length === 0 ? (
-                    <p className="text-muted">Aucun juge actif.</p>
-                  ) : (
-                    <div className="space-y-1">
-                      {activeJudges.map((judge) => (
-                        <p key={judge.id} className="text-body">
-                          {judge.displayName || judge.email || judge.userId || judge.id}
-                        </p>
-                      ))}
-                    </div>
-                  )}
+              )}
+            </div>
+
+            {rankingMode === 'jury' && (
+              <div className="rounded-xl border border-themed bg-black/5 dark:bg-white/5 p-4 space-y-3">
+                <h3 className="text-sm font-semibold text-heading">Gestion du jury</h3>
+                <div className="flex gap-2 flex-wrap">
+                  <input
+                    type="text"
+                    value={judgeIdentifier}
+                    onChange={(e) => setJudgeIdentifier(e.target.value)}
+                    className="input-field flex-1 min-w-[220px]"
+                    placeholder="Email ou UID utilisateur"
+                  />
+                  <button
+                    type="button"
+                    onClick={handleInviteJudge}
+                    disabled={invitingJudge || !judgeIdentifier.trim()}
+                    className="px-4 py-2 rounded-lg border border-primary-500/30 bg-primary-600/20 text-primary-200 text-sm disabled:opacity-60"
+                  >
+                    {invitingJudge ? 'Invitation...' : 'Inviter'}
+                  </button>
+                </div>
+
+                <div className="grid md:grid-cols-2 gap-3 text-xs">
+                  <div className="rounded-lg border border-themed p-3 bg-black/10 dark:bg-white/10 space-y-2">
+                    <p className="text-muted mb-1">Invitations juges</p>
+                    {judgeInvitations.length === 0 ? (
+                      <p className="text-muted">Aucune invitation envoyée.</p>
+                    ) : (
+                      <div className="space-y-2">
+                        {judgeInvitations.map((invitation) => (
+                          <div key={invitation.id} className="rounded-lg border border-themed/60 bg-black/5 dark:bg-white/5 p-2 flex items-start justify-between gap-3">
+                            <div className="min-w-0">
+                              <p className="text-body truncate">{invitation.inviteeLabel || invitation.inviteeEmail || invitation.inviteeUid}</p>
+                              <p className="text-muted text-[11px] capitalize">{invitation.status || 'pending'}</p>
+                              <p className="text-muted text-[11px]">{formatEventDate(normalizeDateLike(invitation.createdAt) || invitation.createdAt)}</p>
+                            </div>
+                            <button
+                              type="button"
+                              className="text-red-400 hover:text-red-300 text-[11px]"
+                              onClick={async () => {
+                                try {
+                                  const tasks = [
+                                    deleteDoc(doc(db, 'buildathons', event.id, 'invitations', invitation.id)),
+                                    deleteDoc(doc(db, 'buildathons', event.id, 'judgeInvitations', invitation.id)),
+                                  ];
+                                  if (invitation.status === 'accepted') {
+                                    tasks.push(deleteDoc(doc(db, 'buildathons', event.id, 'judges', invitation.id)));
+                                  }
+                                  await Promise.all(tasks);
+                                } catch {
+                                  alert('Impossible de supprimer cette invitation');
+                                }
+                              }}
+                            >
+                              {invitation.status === 'accepted' ? 'Révoquer' : 'Supprimer'}
+                            </button>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                  <div className="rounded-lg border border-themed p-3 bg-black/10 dark:bg-white/10 space-y-2">
+                    <p className="text-muted mb-1">Juges actifs</p>
+                    {activeJudges.length === 0 ? (
+                      <p className="text-muted">Aucun juge actif.</p>
+                    ) : (
+                      <div className="space-y-2">
+                        {activeJudges.map((judge) => (
+                          <div key={judge.id} className="rounded-lg border border-themed/60 bg-black/5 dark:bg-white/5 p-2 flex items-center justify-between gap-3">
+                            <div className="min-w-0">
+                              <p className="text-body truncate">{judge.displayName || judge.email || judge.userId || judge.id}</p>
+                              <p className="text-muted text-[11px]">Accepté {formatEventDate(normalizeDateLike(judge.acceptedAt) || judge.acceptedAt)}</p>
+                            </div>
+                            <button
+                              type="button"
+                              className="text-red-400 hover:text-red-300 text-[11px]"
+                              onClick={async () => {
+                                try {
+                                  await deleteDoc(doc(db, 'buildathons', event.id, 'judges', judge.id));
+                                } catch {
+                                  alert('Impossible de supprimer ce juge');
+                                }
+                              }}
+                            >
+                              Supprimer
+                            </button>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
                 </div>
               </div>
-            </div>
+            )}
 
             <div className="grid sm:grid-cols-3 gap-3">
               <div className="p-3 rounded-lg bg-black/5 dark:bg-white/5 border border-themed">

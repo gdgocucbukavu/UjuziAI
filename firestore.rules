@@ -35,31 +35,35 @@ service cloud.firestore {
 
     function projectIsRejected(projectData) {
       return projectData.projectStatus in ['rejete', 'rejected'] ||
+        projectData.status in ['rejete', 'rejected'] ||
         projectData.moderationStatus == 'rejected';
     }
 
     function projectIsDraft(projectData) {
-      return projectData.projectStatus in ['brouillon', 'draft'];
+      return projectData.projectStatus in ['brouillon', 'draft'] ||
+        projectData.status in ['brouillon', 'draft'];
     }
 
     function projectIsPublished(projectData) {
       return projectData.projectStatus in ['publie', 'published'] ||
+        projectData.status in ['publie', 'published'] ||
         projectData.isPublished == true ||
         projectData.isPublic == true;
     }
 
     function projectIsSubmittedOrApproved(projectData) {
-      return projectData.projectStatus in [
-          'soumis', 'submitted', 'pending',
-          'valide', 'validated', 'approved',
-          'publie', 'published'
-        ] ||
-        projectData.moderationStatus == 'approved' ||
-        projectIsPublished(projectData);
+      // In all-submitted mode, any project that is neither draft nor rejected
+      // should be visible to authenticated participants.
+      return !projectIsDraft(projectData) && !projectIsRejected(projectData);
     }
 
     function getProjectVisibility(buildathonData) {
-      return buildathonData.projectVisibility in ['all-submitted', 'allsubmitted', 'all']
+      return (
+        buildathonData.mode == 'jury' ||
+        buildathonData.rankingMode == 'jury' ||
+        buildathonData.juryModeEnabled == true ||
+        buildathonData.projectVisibility in ['all-submitted', 'allsubmitted', 'all']
+      )
         ? 'all-submitted'
         : 'published-only';
     }
@@ -67,6 +71,7 @@ service cloud.firestore {
     function canReadProject(projectData) {
       let buildathonDoc = getBuildathon(projectData.buildathonId);
       let buildathonData = buildathonDoc.data;
+      let projectVisibility = buildathonData != null ? getProjectVisibility(buildathonData) : 'published-only';
 
       return isAdmin() ||
         (projectData.buildathonId is string && isAcceptedJudge(projectData.buildathonId)) ||
@@ -75,11 +80,11 @@ service cloud.firestore {
           isAuthenticated() &&
           projectData.buildathonId is string &&
           buildathonData != null &&
-          !projectIsDraft(projectData) &&
-          !projectIsRejected(projectData) &&
           (
-            (getProjectVisibility(buildathonData) == 'all-submitted' && projectIsSubmittedOrApproved(projectData)) ||
-            (getProjectVisibility(buildathonData) == 'published-only' && projectIsPublished(projectData))
+            // In all-submitted visibility, allow authenticated participants to read
+            // all project documents for the event so collection queries remain valid.
+            (projectVisibility == 'all-submitted') ||
+            (projectVisibility == 'published-only' && projectIsPublished(projectData))
           )
         );
     }
@@ -361,8 +366,18 @@ service cloud.firestore {
       }
 
       // Judge invitation lifecycle per buildathon.
-      match /judgeInvitations/{inviteeUid} {
-        allow read: if isAdmin() || (isAuthenticated() && request.auth.uid == inviteeUid);
+      match /invitations/{inviteeUid} {
+        allow read: if isAdmin() || (isAuthenticated() && (
+          request.auth.uid == inviteeUid ||
+          resource.data.inviteeUid == request.auth.uid ||
+          resource.data.invitedUid == request.auth.uid ||
+          (request.auth.token.email is string && (
+            resource.data.inviteeEmail == request.auth.token.email ||
+            resource.data.invitedEmail == request.auth.token.email ||
+            resource.data.inviteeEmailLower == request.auth.token.email ||
+            resource.data.invitedEmailLower == request.auth.token.email
+          ))
+        ));
 
         allow create: if isAdmin() &&
           request.resource.data.inviteeUid == inviteeUid &&
@@ -371,8 +386,56 @@ service cloud.firestore {
 
         allow update: if isAdmin() || (
           isAuthenticated() &&
-          request.auth.uid == inviteeUid &&
-          resource.data.inviteeUid == request.auth.uid &&
+          (
+            request.auth.uid == inviteeUid ||
+            resource.data.inviteeUid == request.auth.uid ||
+            resource.data.invitedUid == request.auth.uid ||
+            (request.auth.token.email is string && (
+              resource.data.inviteeEmail == request.auth.token.email ||
+              resource.data.invitedEmail == request.auth.token.email ||
+              resource.data.inviteeEmailLower == request.auth.token.email ||
+              resource.data.invitedEmailLower == request.auth.token.email
+            ))
+          ) &&
+          resource.data.buildathonId == buildathonId &&
+          request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'updatedAt', 'respondedAt']) &&
+          request.resource.data.status in ['accepted', 'declined']
+        );
+
+        allow delete: if isAdmin();
+      }
+
+      match /judgeInvitations/{inviteeUid} {
+        allow read: if isAdmin() || (isAuthenticated() && (
+          request.auth.uid == inviteeUid ||
+          resource.data.inviteeUid == request.auth.uid ||
+          resource.data.invitedUid == request.auth.uid ||
+          (request.auth.token.email is string && (
+            resource.data.inviteeEmail == request.auth.token.email ||
+            resource.data.invitedEmail == request.auth.token.email ||
+            resource.data.inviteeEmailLower == request.auth.token.email ||
+            resource.data.invitedEmailLower == request.auth.token.email
+          ))
+        ));
+
+        allow create: if isAdmin() &&
+          request.resource.data.inviteeUid == inviteeUid &&
+          request.resource.data.buildathonId == buildathonId &&
+          request.resource.data.status == 'pending';
+
+        allow update: if isAdmin() || (
+          isAuthenticated() &&
+          (
+            request.auth.uid == inviteeUid ||
+            resource.data.inviteeUid == request.auth.uid ||
+            resource.data.invitedUid == request.auth.uid ||
+            (request.auth.token.email is string && (
+              resource.data.inviteeEmail == request.auth.token.email ||
+              resource.data.invitedEmail == request.auth.token.email ||
+              resource.data.inviteeEmailLower == request.auth.token.email ||
+              resource.data.invitedEmailLower == request.auth.token.email
+            ))
+          ) &&
           resource.data.buildathonId == buildathonId &&
           request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'updatedAt', 'respondedAt']) &&
           request.resource.data.status in ['accepted', 'declined']
@@ -383,7 +446,19 @@ service cloud.firestore {
 
       // Active judges assigned to buildathon.
       match /judges/{judgeUid} {
-        allow read: if isAdmin() || (isAuthenticated() && request.auth.uid == judgeUid);
+        allow read: if isAdmin() || (
+          isAuthenticated() && (
+            request.auth.uid == judgeUid ||
+            (
+              resource.data.active == true &&
+              (
+                getBuildathon(buildathonId).data.mode == 'jury' ||
+                getBuildathon(buildathonId).data.rankingMode == 'jury' ||
+                getBuildathon(buildathonId).data.juryModeEnabled == true
+              )
+            )
+          )
+        );
 
         allow create, update: if isAdmin() || (
           isAuthenticated() &&

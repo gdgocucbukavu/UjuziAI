@@ -360,7 +360,7 @@ export default function Leaderboard() {
                 {getPodiumOrder().map((entry, displayIndex) => {
                   const originalIndex = getPodiumOriginalIndex(displayIndex);
                   const isCurrentUser = entry.id === user?.uid;
-                  const totalPts = (entry.totalScore || 0) + (entry.bonusPoints || 0);
+                  const totalPts = Number(entry.leaderboardScore || 0);
 
                   const podiumStyles = [
                     { // 1st place
@@ -516,7 +516,7 @@ export default function Leaderboard() {
               <div className="text-center p-3 bg-black/5 dark:bg-white/5 rounded-xl">
                 <Target className="w-5 h-5 mx-auto text-accent-400 mb-2" />
                 <p className="text-lg font-bold text-heading">
-                  {leaderboard[0]?.totalScore || 0}<span className="text-xs text-muted font-normal">/{MODULES.length * 10}</span>
+                  {Math.round(Number(leaderboard[0]?.leaderboardScore || 0))}
                 </p>
                 <p className="text-xs text-muted">Meilleur score</p>
               </div>
@@ -524,7 +524,7 @@ export default function Leaderboard() {
                 <BarChart3 className="w-5 h-5 mx-auto text-amber-400 mb-2" />
                 <p className="text-lg font-bold text-heading">
                   {leaderboard.length > 0
-                    ? Math.round(leaderboard.reduce((s, e) => s + (e.totalScore || 0), 0) / leaderboard.length)
+                    ? Math.round(leaderboard.reduce((s, e) => s + Number(e.leaderboardScore || 0), 0) / leaderboard.length)
                     : 0}
                 </p>
                 <p className="text-xs text-muted">Score moyen</p>

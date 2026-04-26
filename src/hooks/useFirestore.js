@@ -488,30 +488,21 @@ export function useLeaderboard() {
     const usersRef = collection(db, 'users');
     const usersQuery = query(usersRef, orderBy('totalScore', 'desc'));
     const projectsRef = collection(db, 'buildathonProjects');
+    const publishedQuery = query(projectsRef, where('isPublished', '==', true));
+    const publicQuery = query(projectsRef, where('isPublic', '==', true));
+    const legacyPublishedQuery = query(projectsRef, where('projectStatus', 'in', ['publie', 'published']));
 
     let usersCache = [];
-    let projectsCache = [];
+    let runtimeCommunityPointsByUser = {};
 
     function recomputeLeaderboard() {
-      const communityPointsByUser = {};
-
-      projectsCache.forEach((project) => {
-        const ownerId = project?.submittedBy;
-        if (!ownerId) return;
-        const voteCount = Number.isFinite(Number(project?.voteCount))
-          ? Number(project.voteCount)
-          : (Array.isArray(project?.votes) ? project.votes.length : 0);
-        const likesCount = Number.isFinite(Number(project?.likesCount))
-          ? Number(project.likesCount)
-          : (Array.isArray(project?.likeUserIds) ? project.likeUserIds.length : 0);
-        const points = (voteCount * 10) + likesCount;
-        communityPointsByUser[ownerId] = (communityPointsByUser[ownerId] || 0) + points;
-      });
-
       const allData = usersCache
         .filter((item) => !ADMIN_EMAILS_HIDDEN.includes(item.email?.toLowerCase()))
         .map((item) => {
-          const communityPoints = Number(communityPointsByUser[item.id] || 0);
+          const persistedCommunityPoints = Number(item.communityPoints || 0);
+          const runtimeCommunityPoints = Number(runtimeCommunityPointsByUser[item.id] || 0);
+          // Prefer server-synced points; keep runtime fallback while function deployment is pending.
+          const communityPoints = Math.max(persistedCommunityPoints, runtimeCommunityPoints);
           const leaderboardScore = Number(item.totalScore || 0) + Number(item.bonusPoints || 0) + communityPoints;
           return {
             ...item,
@@ -531,6 +522,23 @@ export function useLeaderboard() {
       setLoading(false);
     }
 
+    function recomputeRuntimeCommunityPoints(projects) {
+      const byUser = {};
+      projects.forEach((project) => {
+        const ownerId = project?.submittedBy;
+        if (!ownerId) return;
+        const voteCount = Number.isFinite(Number(project?.voteCount))
+          ? Number(project.voteCount)
+          : (Array.isArray(project?.votes) ? project.votes.length : 0);
+        const likesCount = Number.isFinite(Number(project?.likesCount))
+          ? Number(project.likesCount)
+          : (Array.isArray(project?.likeUserIds) ? project.likeUserIds.length : 0);
+        byUser[ownerId] = (byUser[ownerId] || 0) + (voteCount * 10) + likesCount;
+      });
+      runtimeCommunityPointsByUser = byUser;
+      recomputeLeaderboard();
+    }
+
     const unsubUsers = onSnapshot(usersQuery, (snap) => {
       const data = [];
       snap.forEach((docSnap) => data.push({ id: docSnap.id, ...docSnap.data() }));
@@ -541,18 +549,26 @@ export function useLeaderboard() {
       setLoading(false);
     });
 
-    const unsubProjects = onSnapshot(projectsRef, (snap) => {
-      const data = [];
-      snap.forEach((docSnap) => data.push({ id: docSnap.id, ...docSnap.data() }));
-      projectsCache = data;
-      recomputeLeaderboard();
+    const projectDocsById = new Map();
+    const bindProjectListener = (label, projectQuery) => onSnapshot(projectQuery, (snap) => {
+      snap.forEach((docSnap) => {
+        projectDocsById.set(docSnap.id, { id: docSnap.id, ...docSnap.data() });
+      });
+      recomputeRuntimeCommunityPoints(Array.from(projectDocsById.values()));
     }, (error) => {
-      console.error('Error listening to buildathon projects for leaderboard:', error);
+      console.error(`Error listening to ${label} projects for leaderboard fallback:`, error);
+      recomputeRuntimeCommunityPoints(Array.from(projectDocsById.values()));
     });
+
+    const unsubProjectsPublished = bindProjectListener('published', publishedQuery);
+    const unsubProjectsPublic = bindProjectListener('public', publicQuery);
+    const unsubProjectsLegacy = bindProjectListener('legacy-published', legacyPublishedQuery);
 
     return () => {
       unsubUsers();
-      unsubProjects();
+      unsubProjectsPublished();
+      unsubProjectsPublic();
+      unsubProjectsLegacy();
     };
   }, [user]);
 

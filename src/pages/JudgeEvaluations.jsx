@@ -11,7 +11,7 @@ function formatCount(value) {
 }
 
 export default function JudgeEvaluations() {
-  const { user } = useAuth();
+  const { user, userProfile } = useAuth();
   const [loading, setLoading] = useState(true);
   const [invitations, setInvitations] = useState([]);
   const [progressByBuildathon, setProgressByBuildathon] = useState({});
@@ -23,28 +23,113 @@ export default function JudgeEvaluations() {
       return;
     }
 
-    const invitationsQuery = query(
-      collectionGroup(db, 'judgeInvitations'),
-      where('inviteeUid', '==', user.uid)
-    );
+    const legacyUid = String(userProfile?.uid || '').trim();
+    const email = String(user.email || userProfile?.email || '').trim();
+    const emailLower = email.toLowerCase();
 
-    const unsubscribe = onSnapshot(invitationsQuery, (snap) => {
-      const nextInvitations = [];
-      snap.forEach((d) => nextInvitations.push({ id: d.id, ...d.data() }));
-      nextInvitations.sort((a, b) => {
+    // DEBUG: Log current user info to see what we are matching against
+    console.info('[DEBUG] JudgeEvaluations - Current User:', {
+      uid: user.uid,
+      legacyUid,
+      email: user.email,
+      emailLower
+    });
+
+    // SIMPLIFIED QUERIES: 
+    // 1. By UID (primary)
+    // 2. By Lowercase Email (fallback)
+    // We check both 'invitations' and 'judgeInvitations' collections
+    
+    const queries = [
+      query(collectionGroup(db, 'invitations'), where('inviteeUid', '==', user.uid)),
+      query(collectionGroup(db, 'judgeInvitations'), where('inviteeUid', '==', user.uid)),
+      query(collectionGroup(db, 'invitations'), where('invitedUid', '==', user.uid)),
+      query(collectionGroup(db, 'judgeInvitations'), where('invitedUid', '==', user.uid)),
+      query(collectionGroup(db, 'invitations'), where('inviteeEmailLower', '==', emailLower)),
+      query(collectionGroup(db, 'judgeInvitations'), where('inviteeEmailLower', '==', emailLower)),
+      query(collectionGroup(db, 'invitations'), where('invitedEmailLower', '==', emailLower)),
+      query(collectionGroup(db, 'judgeInvitations'), where('invitedEmailLower', '==', emailLower)),
+      query(collectionGroup(db, 'invitations'), where('inviteeEmail', '==', email)),
+      query(collectionGroup(db, 'judgeInvitations'), where('inviteeEmail', '==', email)),
+      query(collectionGroup(db, 'invitations'), where('invitedEmail', '==', email)),
+      query(collectionGroup(db, 'judgeInvitations'), where('invitedEmail', '==', email))
+    ];
+
+    if (legacyUid && legacyUid !== user.uid) {
+      queries.push(
+        query(collectionGroup(db, 'invitations'), where('inviteeUid', '==', legacyUid)),
+        query(collectionGroup(db, 'judgeInvitations'), where('inviteeUid', '==', legacyUid)),
+        query(collectionGroup(db, 'invitations'), where('invitedUid', '==', legacyUid)),
+        query(collectionGroup(db, 'judgeInvitations'), where('invitedUid', '==', legacyUid)),
+        query(collectionGroup(db, 'invitations'), where('inviteeLegacyUid', '==', legacyUid)),
+        query(collectionGroup(db, 'judgeInvitations'), where('inviteeLegacyUid', '==', legacyUid)),
+        query(collectionGroup(db, 'invitations'), where('invitedLegacyUid', '==', legacyUid)),
+        query(collectionGroup(db, 'judgeInvitations'), where('invitedLegacyUid', '==', legacyUid))
+      );
+    }
+
+    const unsubscribers = [];
+    const results = new Map();
+
+    const getStatusPriority = (status) => {
+      if (status === 'accepted') return 3;
+      if (status === 'pending') return 2;
+      if (status === 'declined') return 1;
+      return 0;
+    };
+
+    const setMergedInvitation = (incoming) => {
+      const existing = results.get(incoming.buildathonId);
+      if (!existing) {
+        results.set(incoming.buildathonId, incoming);
+        return;
+      }
+
+      const existingPriority = getStatusPriority(existing.status);
+      const incomingPriority = getStatusPriority(incoming.status);
+
+      if (incomingPriority > existingPriority) {
+        results.set(incoming.buildathonId, incoming);
+      }
+    };
+
+    const updateInvitations = () => {
+      const merged = Array.from(results.values()).sort((a, b) => {
         const aDate = a?.createdAt?.toDate ? a.createdAt.toDate().getTime() : 0;
         const bDate = b?.createdAt?.toDate ? b.createdAt.toDate().getTime() : 0;
         return bDate - aDate;
       });
-      setInvitations(nextInvitations);
+
+      console.info('[DEBUG] JudgeEvaluations - Merged Invitations:', merged.length, merged.map(i => ({
+        id: i.id,
+        buildathonId: i.buildathonId,
+        status: i.status
+      })));
+
+      setInvitations(merged);
       setLoading(false);
-    }, () => {
-      setInvitations([]);
-      setLoading(false);
+    };
+
+    queries.forEach((q, index) => {
+      const unsub = onSnapshot(q, (snap) => {
+        console.info(`[DEBUG] Query ${index} snapshot size:`, snap.size);
+        snap.forEach((d) => {
+          const data = { id: d.id, __sourcePath: d.ref.path, __sourceCollection: d.ref.parent.id, ...d.data() };
+          if (!data.buildathonId) return;
+          // Key by buildathonId to avoid duplicates from different queries/collections.
+          // Keep the strongest status when duplicates exist.
+          setMergedInvitation(data);
+        });
+        updateInvitations();
+      }, (err) => {
+        console.error(`[DEBUG] Query ${index} error:`, err);
+        updateInvitations();
+      });
+      unsubscribers.push(unsub);
     });
 
-    return () => unsubscribe();
-  }, [user?.uid]);
+    return () => unsubscribers.forEach(unsub => unsub());
+  }, [user?.uid, user?.email, userProfile?.uid, userProfile?.email]);
 
   useEffect(() => {
     let cancelled = false;
@@ -106,12 +191,31 @@ export default function JudgeEvaluations() {
 
     const { doc, serverTimestamp, setDoc } = await import('firebase/firestore');
 
-    const invitationRef = doc(db, 'buildathons', invitation.buildathonId, 'judgeInvitations', user.uid);
-    await setDoc(invitationRef, {
+    const invitationData = {
       status,
       updatedAt: serverTimestamp(),
       respondedAt: serverTimestamp(),
-    }, { merge: true });
+    };
+
+    if (import.meta.env.DEV) {
+      console.info('[JudgeEvaluations] invitation decision', {
+        uid: user.uid,
+        buildathonId: invitation.buildathonId,
+        status,
+        invitationId: invitation.id || null,
+        inviteeUid: invitation.inviteeUid || null,
+        invitedUid: invitation.invitedUid || null,
+      });
+    }
+
+    const invitationCollection = invitation.__sourceCollection === 'judgeInvitations' ? 'judgeInvitations' : 'invitations';
+    const invitationDocId = invitation.id || user.uid;
+
+    await Promise.all([
+      setDoc(doc(db, 'buildathons', invitation.buildathonId, invitationCollection, invitationDocId), invitationData, { merge: true }),
+      setDoc(doc(db, 'buildathons', invitation.buildathonId, 'invitations', invitationDocId), invitationData, { merge: true }),
+      setDoc(doc(db, 'buildathons', invitation.buildathonId, 'judgeInvitations', invitationDocId), invitationData, { merge: true }),
+    ]);
 
     if (status === 'accepted') {
       const judgeRef = doc(db, 'buildathons', invitation.buildathonId, 'judges', user.uid);

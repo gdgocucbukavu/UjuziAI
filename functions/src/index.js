@@ -204,3 +204,68 @@ exports.onUserScoreUpdate = functions.firestore
       await orchestrator.agents.ranking.updateLeaderboard();
     }
   });
+
+/**
+ * Keep user communityPoints synchronized from buildathon project interactions.
+ * Formula: votes * 10 + likes for each owned project.
+ */
+exports.onBuildathonProjectCommunityScoreUpdate = functions.firestore
+  .document('buildathonProjects/{projectId}')
+  .onWrite(async (change) => {
+    const before = change.before.exists ? change.before.data() : null;
+    const after = change.after.exists ? change.after.data() : null;
+
+    const getProjectCommunityScore = (data) => {
+      if (!data) return 0;
+      const voteCount = Number.isFinite(Number(data.voteCount))
+        ? Number(data.voteCount)
+        : (Array.isArray(data.votes) ? data.votes.length : 0);
+      const likesCount = Number.isFinite(Number(data.likesCount))
+        ? Number(data.likesCount)
+        : (Array.isArray(data.likeUserIds) ? data.likeUserIds.length : 0);
+      return (voteCount * 10) + likesCount;
+    };
+
+    const beforeOwner = before?.submittedBy || null;
+    const afterOwner = after?.submittedBy || null;
+    const beforeScore = getProjectCommunityScore(before);
+    const afterScore = getProjectCommunityScore(after);
+
+    const updates = [];
+
+    if (beforeOwner && beforeOwner === afterOwner) {
+      const delta = afterScore - beforeScore;
+      if (delta !== 0) {
+        updates.push(
+          db.collection('users').doc(beforeOwner).set(
+            { communityPoints: admin.firestore.FieldValue.increment(delta), updatedAt: admin.firestore.FieldValue.serverTimestamp() },
+            { merge: true }
+          )
+        );
+      }
+    } else {
+      if (beforeOwner && beforeScore !== 0) {
+        updates.push(
+          db.collection('users').doc(beforeOwner).set(
+            { communityPoints: admin.firestore.FieldValue.increment(-beforeScore), updatedAt: admin.firestore.FieldValue.serverTimestamp() },
+            { merge: true }
+          )
+        );
+      }
+
+      if (afterOwner && afterScore !== 0) {
+        updates.push(
+          db.collection('users').doc(afterOwner).set(
+            { communityPoints: admin.firestore.FieldValue.increment(afterScore), updatedAt: admin.firestore.FieldValue.serverTimestamp() },
+            { merge: true }
+          )
+        );
+      }
+    }
+
+    if (updates.length > 0) {
+      await Promise.all(updates);
+    }
+
+    return null;
+  });

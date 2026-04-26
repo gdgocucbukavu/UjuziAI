@@ -1,4 +1,27 @@
-import { Gift, Info, Settings2, CalendarDays, ShieldCheck, Megaphone, X } from 'lucide-react';
+import { Gift, Info, Settings2, CalendarDays, ShieldCheck, Megaphone, X, Image as ImageIcon, AlertCircle } from 'lucide-react';
+
+const FALLBACK_COVER_IMAGE = '/icon-512.png';
+
+function validateCoverImageUrl(rawValue) {
+  const value = String(rawValue || '').trim();
+  if (!value) return { valid: true, url: '', error: '' };
+
+  try {
+    const parsedUrl = new URL(value);
+    if (parsedUrl.protocol !== 'https:') {
+      return { valid: false, url: '', error: 'L’URL doit commencer par https://' };
+    }
+
+    const pathname = parsedUrl.pathname.toLowerCase();
+    if (!/\.(jpg|jpeg|png|gif|webp|avif|bmp|svg)$/.test(pathname)) {
+      return { valid: false, url: '', error: 'L’URL doit pointer vers une image (.jpg, .png, .webp, .svg, etc.)' };
+    }
+
+    return { valid: true, url: parsedUrl.toString(), error: '' };
+  } catch {
+    return { valid: false, url: '', error: 'URL invalide' };
+  }
+}
 
 function Section({ icon: Icon, title, children }) {
   return (
@@ -31,6 +54,8 @@ export default function AdminBuildathonEventForm({
     next[index] = { ...next[index], ...patch };
     onChange((prev) => ({ ...prev, prizes: next }));
   }
+
+  const coverImageState = validateCoverImageUrl(value.coverImageUrl);
 
   return (
     <form onSubmit={onSubmit} className="space-y-4">
@@ -108,7 +133,48 @@ export default function AdminBuildathonEventForm({
               onChange={(e) => setField('coverImageUrl', e.target.value)}
               className="input-field w-full"
               placeholder="https://..."
+              pattern="^https://.*\.(jpg|jpeg|png|gif|webp|avif|bmp|svg)(\?.*)?$"
+              title="URL HTTPS d'image valide (.jpg, .png, .webp, .svg, etc.)"
+              aria-invalid={!coverImageState.valid}
             />
+            <p className={`mt-1 text-[11px] inline-flex items-center gap-1 ${coverImageState.valid ? 'text-muted' : 'text-red-400'}`}>
+              {!coverImageState.valid && <AlertCircle className="w-3 h-3 shrink-0" />}
+              {coverImageState.valid
+                ? 'URL HTTPS d’image valide. La couverture sera affichée sur les cartes événements.'
+                : coverImageState.error}
+            </p>
+
+            <div className="mt-3 rounded-xl border border-themed bg-black/5 dark:bg-white/5 overflow-hidden">
+              <div className="flex items-center gap-2 px-3 py-2 border-b border-themed bg-black/10 dark:bg-white/10">
+                <ImageIcon className="w-4 h-4 text-primary-400" />
+                <span className="text-xs font-semibold text-heading uppercase tracking-wide">Aperçu couverture</span>
+              </div>
+              <div className="relative aspect-[16/6] bg-gradient-to-br from-slate-900 via-slate-800 to-slate-950">
+                {coverImageState.valid && coverImageState.url ? (
+                  <img
+                    src={coverImageState.url}
+                    alt="Aperçu de la couverture"
+                    className="absolute inset-0 h-full w-full object-cover"
+                    onError={(event) => {
+                      event.currentTarget.src = FALLBACK_COVER_IMAGE;
+                    }}
+                  />
+                ) : (
+                  <img
+                    src={FALLBACK_COVER_IMAGE}
+                    alt="Couverture par défaut"
+                    className="absolute inset-0 h-full w-full object-cover opacity-85"
+                  />
+                )}
+                <div className="absolute inset-0 bg-gradient-to-t from-black/60 via-black/10 to-transparent" />
+                <div className="absolute inset-0 flex items-end p-3">
+                  <div className="max-w-[70%] rounded-lg bg-black/45 backdrop-blur-sm px-3 py-2 border border-white/10">
+                    <p className="text-xs font-semibold text-white">{value.title || 'Titre de l’événement'}</p>
+                    <p className="text-[11px] text-white/80">{(value.mode || 'public') === 'jury' ? 'Mode jury' : 'Mode public'}</p>
+                  </div>
+                </div>
+              </div>
+            </div>
           </div>
         </div>
       </Section>
@@ -199,6 +265,34 @@ export default function AdminBuildathonEventForm({
 
       <Section icon={Settings2} title="Paramètres de Vote">
         <div className="grid sm:grid-cols-2 gap-3">
+          <div className="sm:col-span-2">
+            <p className="block text-sm font-medium text-body mb-2">Mode de classement</p>
+            <div className="grid grid-cols-2 gap-2">
+              {[
+                { value: 'public', label: 'Public', description: 'Votes et likes visibles au public' },
+                { value: 'jury', label: 'Jury', description: 'Classement piloté par les juges' },
+              ].map((option) => (
+                <button
+                  key={option.value}
+                  type="button"
+                  onClick={() => setField('mode', option.value)}
+                  className={`rounded-xl border-2 p-3 text-left transition-all ${
+                    (value.mode || 'public') === option.value
+                      ? 'border-primary-500 bg-primary-500/10 text-heading'
+                      : 'border-themed text-body hover:border-primary-500/50'
+                  }`}
+                >
+                  <div className="flex items-center justify-between gap-3">
+                    <span className="font-semibold">{option.label}</span>
+                    <span className={`h-3 w-3 rounded-full ${(value.mode || 'public') === option.value ? 'bg-primary-500' : 'bg-white/20'}`} />
+                  </div>
+                  <p className="mt-1 text-xs text-muted">{option.description}</p>
+                </button>
+              ))}
+            </div>
+            <p className="text-[11px] text-muted mt-2">Le mode jury active la section de gestion des juges dans l’admin et conserve la compatibilité avec les anciens événements.</p>
+          </div>
+
           <label className="flex items-center gap-2 text-sm text-body">
             <input
               type="checkbox"

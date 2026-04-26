@@ -33,7 +33,7 @@ export default function JudgeProjectScoring() {
       return;
     }
 
-    const invitationRef = doc(db, 'buildathons', buildathonId, 'judgeInvitations', user.uid);
+    const invitationRef = doc(db, 'buildathons', buildathonId, 'invitations', user.uid);
     const judgeRef = doc(db, 'buildathons', buildathonId, 'judges', user.uid);
 
     const unsubInvitation = onSnapshot(invitationRef, (snap) => {
