@@ -223,8 +223,9 @@ service cloud.firestore {
     // USERS COLLECTION
     // ============================================
     match /users/{userId} {
-      // Any authenticated user can read any user doc (leaderboard, profile)
-      allow read: if isAuthenticated();
+      // Users can read their own profile; admins can read any.
+      // This protects PII (like email) from mass harvesting.
+      allow read: if isOwner(userId) || isAdmin();
       
       // Users can create their own profile on signup
       allow create: if isOwner(userId);
@@ -241,15 +242,19 @@ service cloud.firestore {
       
       // USER PROGRESS SUBCOLLECTION
       match /progress/{moduleId} {
-        allow read: if isAuthenticated();
+        allow read: if isOwner(userId) || isAdmin();
         allow create: if isOwner(userId);
-        allow update: if isOwner(userId) || isAdmin();
+        // Prevent users from self-assigning scores or validating their own work.
+        allow update: if isAdmin() || (
+          isOwner(userId) &&
+          !request.resource.data.diff(resource.data).affectedKeys().hasAny(['examScore', 'validated', 'examUnlocked', 'badgeId'])
+        );
         allow delete: if isAdmin();
       }
       
       // USER SUBMISSIONS SUBCOLLECTION
       match /submissions/{submissionId} {
-        allow read: if isAuthenticated();
+        allow read: if isOwner(userId) || isAdmin();
         allow create: if isOwner(userId);
         allow update: if isOwner(userId) || isAdmin();
         allow delete: if isAdmin();
@@ -267,7 +272,8 @@ service cloud.firestore {
     // EXAMS COLLECTION
     // ============================================
     match /exams/{examId} {
-      allow read: if isAuthenticated();
+      // Protect exam session privacy and prevent cheating by reading others' sessions.
+      allow read: if isAdmin() || (isAuthenticated() && resource.data.userId == request.auth.uid);
       
       allow create: if isAuthenticated() && 
         request.resource.data.userId == request.auth.uid &&

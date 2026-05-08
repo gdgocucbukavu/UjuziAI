@@ -171,7 +171,7 @@ export function useSubmission() {
     );
     await setDoc(submissionRef, submission);
 
-    // Update progress — auto-validate and unlock exam immediately
+    // Update progress — set to pending review
     const progressRef = doc(db, 'users', user.uid, 'progress', moduleId);
     await setDoc(
       progressRef,
@@ -180,8 +180,8 @@ export function useSubmission() {
         submissionId: submissionRef.id,
         submitted: true,
         submittedAt: serverTimestamp(),
-        validated: true,
-        examUnlocked: true,
+        validated: false,      // Requires admin review
+        examUnlocked: false,   // Requires admin review
         examScore: null,
         examAttempts: 0,
         examLocked: false,

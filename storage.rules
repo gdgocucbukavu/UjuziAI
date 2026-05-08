@@ -3,7 +3,9 @@ service firebase.storage {
   match /b/{bucket}/o {
     // Submissions: users can upload to their own folder
     match /submissions/{userId}/{allPaths=**} {
-      allow read: if request.auth != null;
+      allow read: if request.auth != null && (request.auth.uid == userId || 
+        exists(/databases/(default)/documents/users/$(request.auth.uid)) && 
+        get(/databases/(default)/documents/users/$(request.auth.uid)).data.role == 'admin');
       allow write: if request.auth != null && request.auth.uid == userId
         && request.resource.size < 5 * 1024 * 1024  // Max 5MB per file
         && request.resource.contentType.matches('image/.*');  // Images only
